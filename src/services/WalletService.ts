@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { LookupTableService } from './LookupTableService';
 import csvParser from 'csv-parser';
+import { DatabaseService } from './DatabaseService';
 
 export interface WalletData {
   publicKey: string;
@@ -37,14 +38,85 @@ export class WalletService {
   private walletsPath: string;
   private wallets: Map<number, Keypair> = new Map();
   private lookupTableService: LookupTableService;
+  private dbService: DatabaseService;
+  private useDatabase: boolean = true;
 
   constructor() {
     this.walletsPath = path.join(__dirname, '../../wallets.json');
     this.lookupTableService = new LookupTableService();
+    this.dbService = DatabaseService.getInstance();
     this.loadWallets();
   }
 
-  private loadWallets() {
+  private async loadWallets() {
+    try {
+      if (this.useDatabase) {
+        await this.loadWalletsFromDatabase();
+      } else {
+        this.loadWalletsFromFiles();
+      }
+    } catch (error) {
+      console.error('Error loading wallets:', error);
+      // Если не удалось загрузить из базы данных, пробуем загрузить из файлов
+      if (this.useDatabase) {
+        console.log('Falling back to loading wallets from files...');
+        this.useDatabase = false;
+        this.loadWalletsFromFiles();
+      }
+    }
+  }
+
+  private async loadWalletsFromDatabase() {
+    try {
+      console.log('Loading wallets from database...');
+      
+      // Проверяем, существует ли таблица wallets
+      const tableExists = await this.dbService.query(`
+        SELECT EXISTS (
+          SELECT FROM information_schema.tables 
+          WHERE table_schema = 'public' 
+          AND table_name = 'wallets'
+        );
+      `);
+      
+      if (!tableExists.rows[0].exists) {
+        console.log('Wallets table does not exist in the database. Falling back to files.');
+        this.useDatabase = false;
+        this.loadWalletsFromFiles();
+        return;
+      }
+      
+      // Получаем все кошельки из базы данных
+      const result = await this.dbService.query('SELECT * FROM wallets ORDER BY wallet_number');
+      
+      if (result.rows.length === 0) {
+        console.log('No wallets found in the database. Falling back to files.');
+        this.useDatabase = false;
+        this.loadWalletsFromFiles();
+        return;
+      }
+      
+      // Загружаем кошельки в память
+      result.rows.forEach(row => {
+        const secretKey = Buffer.from(row.private_key, 'base64');
+        const keypair = Keypair.fromSecretKey(secretKey);
+        this.wallets.set(row.wallet_number, keypair);
+        
+        // Если это dev wallet (index 0), устанавливаем его
+        if (row.wallet_number === 0) {
+          this.devWallet = keypair;
+          this.devWalletPublicKey = keypair.publicKey.toString();
+        }
+      });
+      
+      console.log(`Loaded ${this.wallets.size} wallets from the database`);
+    } catch (error) {
+      console.error('Error loading wallets from database:', error);
+      throw error;
+    }
+  }
+
+  private loadWalletsFromFiles() {
     try {
       // Try to load from wallet sets first
       const walletSetsPath = path.join(__dirname, '../../db/wallet-sets.json');
@@ -66,6 +138,7 @@ export class WalletService {
             // If this is dev wallet (index 0), set it
             if (index === 0) {
               this.devWallet = keypair;
+              this.devWalletPublicKey = keypair.publicKey.toString();
             }
           });
           
@@ -86,17 +159,97 @@ export class WalletService {
           
           if (walletData.index === 0) {
             this.devWallet = keypair;
+            this.devWalletPublicKey = keypair.publicKey.toString();
           }
         });
         
         console.log(`Loaded ${this.wallets.size} wallets from JSON`);
       }
     } catch (error) {
-      console.error('Error loading wallets:', error);
+      console.error('Error loading wallets from files:', error);
+      throw error;
     }
   }
 
-  private saveWallets() {
+  private async saveWallets() {
+    try {
+      if (this.useDatabase) {
+        await this.saveWalletsToDatabase();
+      } else {
+        this.saveWalletsToFiles();
+      }
+    } catch (error) {
+      console.error('Error saving wallets:', error);
+      throw error;
+    }
+  }
+
+  private async saveWalletsToDatabase() {
+    try {
+      console.log('Saving wallets to database...');
+      
+      // Проверяем, существует ли таблица wallets
+      const tableExists = await this.dbService.query(`
+        SELECT EXISTS (
+          SELECT FROM information_schema.tables 
+          WHERE table_schema = 'public' 
+          AND table_name = 'wallets'
+        );
+      `);
+      
+      if (!tableExists.rows[0].exists) {
+        console.log('Wallets table does not exist in the database. Creating it...');
+        const sqlFilePath = path.join(__dirname, '../db/migrations/001_create_wallets_table.sql');
+        const sqlScript = fs.readFileSync(sqlFilePath, 'utf8');
+        await this.dbService.query(sqlScript);
+      }
+      
+      // Используем транзакцию для атомарного обновления
+      const client = await this.dbService.getClient();
+      try {
+        await client.query('BEGIN');
+        
+        // Очищаем таблицу перед вставкой новых данных
+        await client.query('DELETE FROM wallets');
+        
+        // Вставляем данные в базу данных
+        for (const [indexStr, keypair] of this.wallets.entries()) {
+          const index = Number(indexStr);
+          let type: WalletData['type'];
+          if (index === 0) type = 'dev';
+          else if (index >= 1 && index <= 23) type = 'bundle';
+          else if (index === 24) type = 'bundle_payer';
+          else if (index === 25) type = 'market_maker_payer';
+          else type = 'market_maker';
+          
+          await client.query(
+            `INSERT INTO wallets (wallet_number, public_key, private_key, wallet_type) 
+             VALUES ($1, $2, $3, $4)`,
+            [
+              index,
+              keypair.publicKey.toString(),
+              Buffer.from(keypair.secretKey).toString('base64'),
+              type
+            ]
+          );
+        }
+        
+        await client.query('COMMIT');
+        console.log(`Saved ${this.wallets.size} wallets to the database`);
+      } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error during database transaction:', error);
+        throw error;
+      } finally {
+        client.release();
+      }
+    } catch (error) {
+      console.error('Error saving wallets to database:', error);
+      throw error;
+    }
+  }
+
+  private saveWalletsToFiles() {
     try {
       const walletsData: WalletData[] = [];
       
@@ -148,6 +301,23 @@ export class WalletService {
       // If a keypair is provided, use it directly
       this.devWallet = wallet;
       this.devWalletPublicKey = wallet.publicKey.toString();
+      
+      // Обновляем dev wallet в базе данных, если используем базу данных
+      if (this.useDatabase) {
+        try {
+          await this.dbService.query(
+            `UPDATE wallets SET public_key = $1, private_key = $2, updated_at = CURRENT_TIMESTAMP 
+             WHERE wallet_number = 0`,
+            [
+              wallet.publicKey.toString(),
+              Buffer.from(wallet.secretKey).toString('base64')
+            ]
+          );
+        } catch (error) {
+          console.error('Error updating dev wallet in database:', error);
+        }
+      }
+      
       console.log('Dev wallet set in WalletService:', wallet.publicKey.toString());
     }
   }
@@ -252,26 +422,46 @@ export class WalletService {
           type: 'dev' as const
         };
 
-        console.log('Creating bundle lookup table...');
-        // Get bundle wallets (1-23) and bundle payer (24)
-        const bundleWallets = wallets.filter(w => w.index >= 1 && w.index <= 24);
-        bundleLUT = await this.lookupTableService.createLookupTable(devWalletData, bundleWallets);
+        // Create bundle LUT
+        const bundleAddresses = wallets
+          .filter(w => w.type === 'bundle')
+          .map(w => new PublicKey(w.publicKey));
+        
+        bundleLUT = await this.lookupTableService.createLookupTable(
+          this.devWallet,
+          bundleAddresses,
+          'bundle'
+        );
 
-        console.log('Creating market making lookup table...');
-        // Get market making wallets (26-100) and market making payer (25)
-        const marketMakingWallets = wallets.filter(w => w.index >= 25 && w.index <= 100);
-        marketMakingLUT = await this.lookupTableService.createLookupTable(devWalletData, marketMakingWallets);
+        // Create market making LUT
+        const marketMakingAddresses = wallets
+          .filter(w => w.type === 'market_maker')
+          .map(w => new PublicKey(w.publicKey));
+        
+        marketMakingLUT = await this.lookupTableService.createLookupTable(
+          this.devWallet,
+          marketMakingAddresses,
+          'market_making'
+        );
       } catch (err: any) {
         console.error('Error creating lookup tables:', err);
-        
-        // Check if it's a "no SOL" error
-        if (err.message && err.message.includes('debit an account but found no record of a prior credit')) {
-          error = `Dev wallet has insufficient SOL to pay for Lookup Table creation. Please fund the dev wallet first.`;
-        } else {
-          error = 'Failed to create Lookup Tables: ' + err.message;
-        }
-        // Continue even if LUT creation fails
+        error = err.message;
       }
+    }
+
+    // Update our internal wallets map
+    this.wallets.clear();
+    wallets.forEach(walletData => {
+      const secretKey = Buffer.from(walletData.privateKey, 'base64');
+      const keypair = Keypair.fromSecretKey(secretKey);
+      this.wallets.set(walletData.index, keypair);
+    });
+
+    // Save to database if using database
+    if (this.useDatabase) {
+      await this.saveWalletsToDatabase();
+    } else {
+      this.saveWalletsToFiles();
     }
 
     return {
@@ -283,18 +473,35 @@ export class WalletService {
     };
   }
 
-  /**
-   * Gets a wallet by its index
-   * @param index The index of the wallet to get (0 for dev wallet)
-   * @returns The wallet keypair or null if not found
-   */
   async getWallet(index: number): Promise<Keypair | null> {
-    const wallet = this.wallets.get(index);
-    if (wallet) {
-      console.log(`Found wallet ${index} with public key: ${wallet.publicKey.toString()}`);
-      return wallet;
+    // Если кошелек уже загружен в память, возвращаем его
+    if (this.wallets.has(index)) {
+      return this.wallets.get(index) || null;
     }
-    console.error(`Wallet with index ${index} not found`);
+    
+    // Если используем базу данных, пытаемся загрузить кошелек из базы данных
+    if (this.useDatabase) {
+      try {
+        const result = await this.dbService.query(
+          'SELECT * FROM wallets WHERE wallet_number = $1',
+          [index]
+        );
+        
+        if (result.rows.length > 0) {
+          const row = result.rows[0];
+          const secretKey = Buffer.from(row.private_key, 'base64');
+          const keypair = Keypair.fromSecretKey(secretKey);
+          
+          // Кэшируем кошелек в памяти
+          this.wallets.set(index, keypair);
+          
+          return keypair;
+        }
+      } catch (error) {
+        console.error(`Error loading wallet #${index} from database:`, error);
+      }
+    }
+    
     return null;
   }
 

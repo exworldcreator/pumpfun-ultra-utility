@@ -23,25 +23,25 @@ export class LookupTableService {
   /**
    * Create a new Address Lookup Table
    * @param payerWallet The wallet that will pay for the LUT creation
-   * @param wallets The wallets to add to the LUT
+   * @param addresses The addresses to add to the LUT
+   * @param label Optional label for the LUT (for logging purposes)
    * @returns The address of the created LUT
    */
   async createLookupTable(
-    payerWallet: WalletData,
-    wallets: WalletData[]
+    payerWallet: Keypair,
+    addresses: PublicKey[],
+    label: string = ''
   ): Promise<string> {
     try {
-      const payerKeypair = Keypair.fromSecretKey(
-        Buffer.from(payerWallet.privateKey, 'base64')
-      );
-
       // Check payer wallet balance
-      const balance = await this.connection.getBalance(payerKeypair.publicKey);
+      const balance = await this.connection.getBalance(payerWallet.publicKey);
       const balanceInSOL = balance / LAMPORTS_PER_SOL;
       
       if (balanceInSOL < 0.03) {
         throw new Error(`Dev wallet has insufficient SOL (${balanceInSOL.toFixed(4)} SOL) for creating Lookup Tables. Please fund with at least 0.03 SOL.`);
       }
+
+      console.log(`Creating ${label ? label + ' ' : ''}lookup table with ${addresses.length} addresses...`);
 
       // Get recent slot for LUT creation with retries
       let slot: number;
@@ -70,8 +70,8 @@ export class LookupTableService {
 
       // Create instruction to create a new LUT
       const [createInstruction, lookupTableAddress] = AddressLookupTableProgram.createLookupTable({
-        authority: payerKeypair.publicKey,
-        payer: payerKeypair.publicKey,
+        authority: payerWallet.publicKey,
+        payer: payerWallet.publicKey,
         recentSlot: slot!
       });
 
@@ -82,7 +82,7 @@ export class LookupTableService {
       const createSignature = await sendAndConfirmTransaction(
         this.connection,
         createTransaction,
-        [payerKeypair],
+        [payerWallet],
         { commitment: 'confirmed' }
       );
       
@@ -93,18 +93,15 @@ export class LookupTableService {
       console.log('Waiting for lookup table to be confirmed...');
       await new Promise(resolve => setTimeout(resolve, 5000));
       
-      // Extract public keys from wallets
-      const publicKeys = wallets.map(wallet => new PublicKey(wallet.publicKey));
-      
       // Add addresses to the LUT in batches (max 30 per transaction)
       const batchSize = 30;
-      for (let i = 0; i < publicKeys.length; i += batchSize) {
-        const batch = publicKeys.slice(i, i + batchSize);
+      for (let i = 0; i < addresses.length; i += batchSize) {
+        const batch = addresses.slice(i, i + batchSize);
         
         // Create instruction to extend the LUT with addresses
         const extendInstruction = AddressLookupTableProgram.extendLookupTable({
-          payer: payerKeypair.publicKey,
-          authority: payerKeypair.publicKey,
+          payer: payerWallet.publicKey,
+          authority: payerWallet.publicKey,
           lookupTable: lookupTableAddress,
           addresses: batch
         });
@@ -116,7 +113,7 @@ export class LookupTableService {
           const extendSignature = await sendAndConfirmTransaction(
             this.connection,
             extendTransaction,
-            [payerKeypair],
+            [payerWallet],
             { commitment: 'confirmed' }
           );
           

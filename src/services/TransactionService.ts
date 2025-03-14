@@ -219,15 +219,19 @@ export class TransactionService {
     try {
       // Create Lookup Tables
       console.log('Creating bundle lookup table...');
+      const bundleAddresses = bundleWallets.map(w => new PublicKey(w.publicKey));
       this.bundleLUT = await this.lookupTableService.createLookupTable(
-        devWalletData,
-        bundleWallets
+        this.walletService.getDevWallet()!,
+        bundleAddresses,
+        'bundle'
       );
 
       console.log('Creating market making lookup table...');
+      const marketMakingAddresses = marketMakingWallets.map(w => new PublicKey(w.publicKey));
       this.marketMakingLUT = await this.lookupTableService.createLookupTable(
-        devWalletData,
-        marketMakingWallets
+        this.walletService.getDevWallet()!,
+        marketMakingAddresses,
+        'market_making'
       );
 
       return {
