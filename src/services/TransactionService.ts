@@ -267,113 +267,305 @@ export class TransactionService {
     throw lastError;
   }
 
+  private async distributeToMarketMakersBatch(
+    startIndex: number,
+    endIndex: number,
+    walletAmounts: { [key: number]: number },
+    marketMakingPayer: Keypair,
+    progressCallback?: (text: string) => Promise<void>
+  ): Promise<string[]> {
+    const signatures: string[] = [];
+    const BATCH_SIZE = 3;
+
+    console.log(`Начинаем распределение для кошельков ${startIndex}-${endIndex}`);
+    console.log(`Баланс кошелька #25 перед распределением: ${await this.connection.getBalance(marketMakingPayer.publicKey) / LAMPORTS_PER_SOL} SOL`);
+
+    for (let i = startIndex; i <= endIndex; i += BATCH_SIZE) {
+      const batchPromises = [];
+      const currentEndIndex = Math.min(i + BATCH_SIZE - 1, endIndex);
+      
+      console.log(`\nОбработка пакета кошельков ${i}-${currentEndIndex}:`);
+
+      for (let j = i; j <= currentEndIndex; j++) {
+        const targetWallet = this.walletService.getWalletByIndex(j);
+        if (!targetWallet) {
+          throw new Error(`Target wallet #${j} not found`);
+        }
+
+        const actualAmount = walletAmounts[j];
+        console.log(`Подготовка транзакции: ${actualAmount / LAMPORTS_PER_SOL} SOL на кошелек #${j}`);
+        
+        if (progressCallback) {
+          await progressCallback(`Отправка ${actualAmount / LAMPORTS_PER_SOL} SOL на кошелек #${j}...`);
+        }
+
+        const sendTransaction = async () => {
+          console.log(`Начало отправки транзакции на кошелек #${j}`);
+          const transaction = new Transaction().add(
+            SystemProgram.transfer({
+              fromPubkey: marketMakingPayer.publicKey,
+              toPubkey: targetWallet.publicKey,
+              lamports: actualAmount
+            })
+          );
+
+          return this.retryWithBackoff(async () => {
+            try {
+              const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
+              transaction.recentBlockhash = blockhash;
+              transaction.lastValidBlockHeight = lastValidBlockHeight;
+
+              const confirmOptions = {
+                skipPreflight: false,
+                commitment: 'confirmed' as const,
+                preflightCommitment: 'confirmed' as const,
+                maxRetries: 5
+              };
+
+              const signature = await sendAndConfirmTransaction(
+                this.connection,
+                transaction,
+                [marketMakingPayer],
+                confirmOptions
+              );
+              console.log(`✅ Успешная транзакция на кошелек #${j}: ${signature}`);
+              return signature;
+            } catch (error) {
+              if (error instanceof Error) {
+                console.error(`❌ Ошибка при отправке на кошелек #${j}:`, error.message);
+                if (error.message.includes('429 Too Many Requests')) {
+                  await this.sleep(5000);
+                  this.switchToNextRPC();
+                  throw error;
+                } else if (error.message.includes('insufficient funds')) {
+                  throw new Error(`Insufficient funds in wallet #25 for distribution to wallet #${j}`);
+                } else if (error.message.includes('blockhash not found')) {
+                  this.switchToNextRPC();
+                  throw error;
+                }
+              }
+              throw error;
+            }
+          }, 5, 1000);
+        };
+
+        await this.sleep(500);
+        console.log(`Добавление транзакции для кошелька #${j} в пакет`);
+        batchPromises.push(sendTransaction());
+      }
+
+      try {
+        console.log(`\nОжидание выполнения пакета транзакций ${i}-${currentEndIndex}...`);
+        const batchSignatures = await Promise.all(batchPromises);
+        signatures.push(...batchSignatures);
+        console.log(`✅ Пакет ${i}-${currentEndIndex} успешно обработан`);
+
+        if (i + BATCH_SIZE <= endIndex) {
+          if (progressCallback) {
+            await progressCallback('Делаем паузу между пакетами...');
+          }
+          console.log(`Пауза 3 секунды перед следующим пакетом`);
+          await this.sleep(3000);
+        }
+      } catch (error) {
+        console.error(`❌ Ошибка при обработке пакета ${i}-${currentEndIndex}:`, error);
+        throw error;
+      }
+    }
+
+    console.log(`\nРаспределение для кошельков ${startIndex}-${endIndex} завершено`);
+    console.log(`Баланс кошелька #25 после распределения: ${await this.connection.getBalance(marketMakingPayer.publicKey) / LAMPORTS_PER_SOL} SOL`);
+    return signatures;
+  }
+
   public async distributeToMarketMakers(
     amount: number,
     useLookupTable: boolean = false,
     progressCallback?: (text: string) => Promise<void>
   ): Promise<string[]> {
     try {
-      const signatures: string[] = [];
       const marketMakingPayer = this.walletService.getWalletByIndex(25);
-      
       if (!marketMakingPayer) {
         throw new Error('Market making payer wallet (#25) not found');
       }
 
+      // Проверяем баланс кошелька #25
+      const payerBalance = await this.connection.getBalance(marketMakingPayer.publicKey);
       const totalAmount = amount * LAMPORTS_PER_SOL;
-      const baseAmountPerWallet = Math.floor(totalAmount / 75);
+      
+      // Учитываем комиссии за транзакции (примерно 0.000005 SOL за транзакцию)
+      const transactionFee = 5000;
+      const numberOfTransactions = 75 * 2; // Удваиваем количество транзакций (rent + distribution)
+      const totalFees = transactionFee * numberOfTransactions;
+      
+      // Получаем минимальный баланс для rent-exempt статуса
+      const rentExemptBalance = await this.connection.getMinimumBalanceForRentExemption(0);
+      const totalRentExempt = rentExemptBalance * 75; // Для всех кошельков
+      
+      console.log(`Минимальный баланс для rent-exempt: ${rentExemptBalance / LAMPORTS_PER_SOL} SOL`);
+      console.log(`Всего нужно для rent-exempt: ${totalRentExempt / LAMPORTS_PER_SOL} SOL`);
+      
+      // Проверяем, достаточно ли средств для всех транзакций с учетом rent-exempt
+      const requiredAmount = totalAmount + totalFees + totalRentExempt;
+      
+      if (payerBalance < requiredAmount) {
+        throw new Error(`Insufficient funds in wallet #25. Required: ${requiredAmount / LAMPORTS_PER_SOL} SOL (including rent-exempt and fees), Available: ${payerBalance / LAMPORTS_PER_SOL} SOL`);
+      }
 
-      // Calculate total remaining amount to distribute
+      console.log(`Баланс кошелька #25: ${payerBalance / LAMPORTS_PER_SOL} SOL`);
+      console.log(`Необходимо для распределения: ${totalAmount / LAMPORTS_PER_SOL} SOL`);
+      console.log(`Комиссии за транзакции: ${totalFees / LAMPORTS_PER_SOL} SOL`);
+      console.log(`Необходимо для rent-exempt: ${totalRentExempt / LAMPORTS_PER_SOL} SOL`);
+      console.log(`Всего необходимо: ${requiredAmount / LAMPORTS_PER_SOL} SOL`);
+
+      // Рассчитываем базовую сумму на кошелек для распределения (без учета rent-exempt)
+      const baseAmountPerWallet = Math.floor(totalAmount / 75);
+      
+      // Рассчитываем суммы для распределения
       let remainingAmount = totalAmount;
       const walletAmounts: { [key: number]: number } = {};
+      const rentAmounts: { [key: number]: number } = {};
 
-      // First pass: assign randomized amounts to all wallets except the last one
       for (let i = 26; i < 100; i++) {
+        // Сумма для rent-exempt
+        rentAmounts[i] = rentExemptBalance;
+        
+        // Сумма для распределения
         const randomizedAmount = this.getRandomizedAmount(baseAmountPerWallet);
         walletAmounts[i] = randomizedAmount;
         remainingAmount -= randomizedAmount;
       }
-      // Last wallet gets the remaining amount to ensure total is correct
+      
+      // Последний кошелек
+      rentAmounts[100] = rentExemptBalance;
       walletAmounts[100] = remainingAmount;
 
-      // Process in batches of 5 transactions
-      const BATCH_SIZE = 5;
-      for (let i = 26; i <= 100; i += BATCH_SIZE) {
-        const batchPromises = [];
-        const endIndex = Math.min(i + BATCH_SIZE - 1, 100);
+      // Функция для отправки одной транзакции
+      const sendSingleTransaction = async (
+        targetWallet: Keypair,
+        amount: number,
+        description: string
+      ): Promise<string> => {
+        const transaction = new Transaction().add(
+          SystemProgram.transfer({
+            fromPubkey: marketMakingPayer.publicKey,
+            toPubkey: targetWallet.publicKey,
+            lamports: amount
+          })
+        );
 
-        for (let j = i; j <= endIndex; j++) {
-          const targetWallet = this.walletService.getWalletByIndex(j);
-          if (!targetWallet) {
-            throw new Error(`Target wallet #${j} not found`);
-          }
+        return this.retryWithBackoff(async () => {
+          try {
+            const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
+            transaction.recentBlockhash = blockhash;
+            transaction.lastValidBlockHeight = lastValidBlockHeight;
 
-          const actualAmount = walletAmounts[j];
-          if (progressCallback) {
-            await progressCallback(`Отправка ${actualAmount / LAMPORTS_PER_SOL} SOL на кошелек #${j}...`);
-          }
+            const confirmOptions = {
+              skipPreflight: false,
+              commitment: 'confirmed' as const,
+              preflightCommitment: 'confirmed' as const,
+              maxRetries: 5
+            };
 
-          const sendTransaction = async () => {
-            const transaction = new Transaction().add(
-              SystemProgram.transfer({
-                fromPubkey: marketMakingPayer.publicKey,
-                toPubkey: targetWallet.publicKey,
-                lamports: actualAmount
-              })
+            const signature = await sendAndConfirmTransaction(
+              this.connection,
+              transaction,
+              [marketMakingPayer],
+              confirmOptions
             );
-
-            return this.retryWithBackoff(async () => {
-              try {
-                const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
-                transaction.recentBlockhash = blockhash;
-                transaction.lastValidBlockHeight = lastValidBlockHeight;
-
-                const confirmOptions = {
-                  skipPreflight: false,
-                  commitment: 'confirmed' as const,
-                  preflightCommitment: 'confirmed' as const,
-                  maxRetries: 5
-                };
-
-                return await sendAndConfirmTransaction(
-                  this.connection,
-                  transaction,
-                  [marketMakingPayer],
-                  confirmOptions
-                );
-              } catch (error) {
-                if (error instanceof Error) {
-                  if (error.message.includes('429 Too Many Requests')) {
-                    throw error;
-                  } else if (error.message.includes('insufficient funds')) {
-                    throw new Error(`Insufficient funds in wallet #25 for distribution to wallet #${j}`);
-                  } else if (error.message.includes('blockhash not found')) {
-                    this.switchToNextRPC();
-                    throw error;
-                  }
-                }
+            console.log(`✅ ${description}: ${signature}`);
+            return signature;
+          } catch (error) {
+            if (error instanceof Error) {
+              console.error(`❌ Ошибка при ${description}:`, error.message);
+              if (error.message.includes('429 Too Many Requests')) {
+                await this.sleep(5000);
+                this.switchToNextRPC();
                 throw error;
               }
-            }, 5, 1000);
-          };
-
-          batchPromises.push(sendTransaction());
-        }
-
-        try {
-          const batchSignatures = await Promise.all(batchPromises);
-          signatures.push(...batchSignatures);
-
-          if (i + BATCH_SIZE <= 100) {
-            await this.sleep(2000);
+              throw error;
+            }
+            throw error;
           }
-        } catch (error) {
-          console.error(`Error processing batch ${i}-${endIndex}:`, error);
-          throw error;
-        }
-      }
+        }, 5, 1000);
+      };
 
-      return signatures;
+      // Модифицируем функцию distributeToMarketMakersBatch
+      const distributeToMarketMakersBatch = async (
+        startIndex: number,
+        endIndex: number
+      ): Promise<string[]> => {
+        const signatures: string[] = [];
+        const BATCH_SIZE = 3;
+
+        console.log(`\nНачинаем распределение для кошельков ${startIndex}-${endIndex}`);
+
+        for (let i = startIndex; i <= endIndex; i += BATCH_SIZE) {
+          const batchPromises = [];
+          const currentEndIndex = Math.min(i + BATCH_SIZE - 1, endIndex);
+          
+          for (let j = i; j <= currentEndIndex; j++) {
+            const targetWallet = this.walletService.getWalletByIndex(j);
+            if (!targetWallet) {
+              throw new Error(`Target wallet #${j} not found`);
+            }
+
+            // Сначала отправляем rent-exempt
+            if (progressCallback) {
+              await progressCallback(`Отправка rent-exempt ${rentAmounts[j] / LAMPORTS_PER_SOL} SOL на кошелек #${j}...`);
+            }
+            const rentSignature = await sendSingleTransaction(
+              targetWallet,
+              rentAmounts[j],
+              `Отправка rent-exempt на кошелек #${j}`
+            );
+            signatures.push(rentSignature);
+
+            await this.sleep(500);
+
+            // Затем отправляем сумму распределения
+            if (progressCallback) {
+              await progressCallback(`Отправка ${walletAmounts[j] / LAMPORTS_PER_SOL} SOL на кошелек #${j}...`);
+            }
+            const distributionSignature = await sendSingleTransaction(
+              targetWallet,
+              walletAmounts[j],
+              `Отправка распределения на кошелек #${j}`
+            );
+            signatures.push(distributionSignature);
+          }
+
+          if (i + BATCH_SIZE <= endIndex) {
+            if (progressCallback) {
+              await progressCallback('Делаем паузу между пакетами...');
+            }
+            console.log(`Пауза 3 секунды перед следующим пакетом`);
+            await this.sleep(3000);
+          }
+        }
+
+        return signatures;
+      };
+
+      // Распределяем первую часть (26-29)
+      if (progressCallback) {
+        await progressCallback('Начинаем распределение первой части (кошельки 26-29)...');
+      }
+      const firstBatchSignatures = await distributeToMarketMakersBatch(26, 29);
+
+      // Делаем длительную паузу перед второй частью
+      if (progressCallback) {
+        await progressCallback('Делаем длительную паузу перед кошельком #30...');
+      }
+      await this.sleep(15000);
+
+      // Распределяем вторую часть (30-100)
+      if (progressCallback) {
+        await progressCallback('Начинаем распределение второй части (кошельки 30-100)...');
+      }
+      const secondBatchSignatures = await distributeToMarketMakersBatch(30, 100);
+
+      return [...firstBatchSignatures, ...secondBatchSignatures];
     } catch (error) {
       console.error('Error in distributeToMarketMakers:', error);
       throw error;
