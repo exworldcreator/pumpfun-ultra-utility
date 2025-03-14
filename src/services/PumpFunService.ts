@@ -14,6 +14,7 @@ import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   getAssociatedTokenAddress,
   createAssociatedTokenAccountInstruction,
+  createTransferInstruction,
 } from '@solana/spl-token';
 import { Buffer } from 'buffer';
 import PinataSDK from '@pinata/sdk';
@@ -66,15 +67,82 @@ export interface TokenCreationWithBuyResult extends TokenCreationResult {
 }
 
 export class PumpFunService {
-  private readonly connection: Connection;
+  private readonly rpcEndpoints = [
+    'https://mainnet.helius-rpc.com/?api-key=7f8f12d7-e70d-4d5f-a2c4-edfa78c89c7f'
+  ];
+  private connection: Connection;
   private walletService: WalletService;
   public readonly MIN_SOL_BALANCE = 0.015;
-  private readonly metaplex: Metaplex;
+  private metaplex: Metaplex;
 
-  constructor(walletService: WalletService, rpcUrl: string = 'https://api.mainnet-beta.solana.com') {
+  constructor(walletService: WalletService, rpcUrl?: string) {
     this.walletService = walletService;
-    this.connection = new Connection(rpcUrl);
+    this.connection = new Connection(rpcUrl || this.rpcEndpoints[0]);
     this.metaplex = new Metaplex(this.connection);
+  }
+
+  /**
+   * Переподключается к RPC при ошибках
+   */
+  private switchRpc(): void {
+    console.log('Переподключение к Helius RPC...');
+    this.connection = new Connection(this.rpcEndpoints[0]);
+    this.metaplex = new Metaplex(this.connection);
+  }
+
+  /**
+   * Выполняет запрос с автоматическими повторами при ошибке
+   * @param action Функция, выполняющая запрос
+   * @returns Результат запроса
+   */
+  private async executeWithRpcFailover<T>(action: () => Promise<T>): Promise<T> {
+    const maxAttempts = 3;
+    const baseDelay = 1000; // 1 секунда
+    
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      try {
+        return await action();
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        
+        // Если это последняя попытка, пробрасываем ошибку
+        if (attempt === maxAttempts - 1) {
+          throw error;
+        }
+        
+        // Проверяем на ошибку 429
+        if (errorMessage.includes('429') || errorMessage.includes('Too Many Requests')) {
+          const delay = baseDelay * Math.pow(2, attempt); // Экспоненциальная задержка
+          console.log(`RPC rate limit exceeded (429). Retrying in ${delay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          this.switchRpc(); // Переподключаемся к RPC
+          continue;
+        }
+        
+        throw error;
+      }
+    }
+    
+    throw new Error('Failed to execute after maximum retries');
+  }
+
+  // Модифицируем существующие методы для использования executeWithRpcFailover
+  async getBalance(publicKey: PublicKey): Promise<number> {
+    return this.executeWithRpcFailover(() => this.connection.getBalance(publicKey));
+  }
+
+  async getTokenAccountBalance(account: PublicKey): Promise<any> {
+    return this.executeWithRpcFailover(() => this.connection.getTokenAccountBalance(account));
+  }
+
+  async sendAndConfirmTransaction(
+    transaction: Transaction,
+    signers: Keypair[],
+    options?: any
+  ): Promise<string> {
+    return this.executeWithRpcFailover(() => 
+      sendAndConfirmTransaction(this.connection, transaction, signers, options)
+    );
   }
 
   /**
@@ -344,8 +412,7 @@ export class PumpFunService {
       const transaction = new Transaction();
       transaction.add(createInstruction);
 
-      const signature = await sendAndConfirmTransaction(
-        this.connection,
+      const signature = await this.sendAndConfirmTransaction(
         transaction,
         [payer, mintKeypair],
         { commitment: 'confirmed' }
@@ -548,14 +615,10 @@ export class PumpFunService {
       transaction.feePayer = payer.publicKey;
 
       console.log('Sending transaction...');
-      const signature = await sendAndConfirmTransaction(
-        this.connection,
+      const signature = await this.sendAndConfirmTransaction(
         transaction,
         [payer],
-        { 
-          commitment: 'confirmed',
-          skipPreflight: false
-        }
+        { commitment: 'confirmed' }
       );
 
       // Проверяем результат транзакции
@@ -797,8 +860,7 @@ export class PumpFunService {
 
         // Send and confirm transaction
         console.log('Sending transaction...');
-        const signature = await sendAndConfirmTransaction(
-          this.connection,
+        const signature = await this.sendAndConfirmTransaction(
           transaction,
           [payer],
           {
@@ -1037,6 +1099,400 @@ export class PumpFunService {
     } catch (error) {
       console.error('Error in sellAllTokens:', error);
       throw error;
+    }
+  }
+
+  async distributeTokensViaProxy(
+    mint: PublicKey,
+    fromWallet: Keypair,
+    targetWallets: number[],
+    proxyWallets: number[],
+    progressCallback?: (text: string) => Promise<void>
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      // 1. Сначала распределяем токены по прокси-кошелькам
+      const tokensPerProxy = Math.ceil(targetWallets.length / proxyWallets.length);
+      
+      // Получаем баланс токенов на исходном кошельке
+      const fromTokenAccount = await getAssociatedTokenAddress(mint, fromWallet.publicKey);
+      const balance = await this.connection.getTokenAccountBalance(fromTokenAccount);
+      const totalTokens = balance.value.uiAmount || 0;
+      
+      // Вычисляем количество токенов для каждого прокси
+      const tokensPerDistribution = totalTokens / proxyWallets.length;
+
+      // 2. Отправляем токены на прокси-кошельки
+      for (let i = 0; i < proxyWallets.length; i++) {
+        if (progressCallback) {
+          await progressCallback(`Отправка токенов на прокси-кошелек #${proxyWallets[i]}...`);
+        }
+
+        const proxyWallet = await this.walletService.getWallet(proxyWallets[i]);
+        if (!proxyWallet) continue;
+
+        await this.transferTokens(
+          mint,
+          fromWallet,
+          proxyWallet.publicKey,
+          tokensPerDistribution
+        );
+
+        // Добавляем задержку между транзакциями
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+
+      // 3. Распределяем токены с прокси-кошельков на целевые
+      for (let i = 0; i < targetWallets.length; i++) {
+        const proxyIndex = Math.floor(i / tokensPerProxy);
+        const proxyWallet = await this.walletService.getWallet(proxyWallets[proxyIndex]);
+        const targetWallet = await this.walletService.getWallet(targetWallets[i]);
+
+        if (!proxyWallet || !targetWallet) continue;
+
+        if (progressCallback) {
+          await progressCallback(
+            `Распределение токенов с прокси #${proxyWallets[proxyIndex]} на кошелек #${targetWallets[i]}...`
+          );
+        }
+
+        await this.transferTokens(
+          mint,
+          proxyWallet,
+          targetWallet.publicKey,
+          tokensPerDistribution / tokensPerProxy
+        );
+
+        // Добавляем задержку между транзакциями
+        await new Promise(resolve => setTimeout(resolve, 200));
+      }
+
+      return { success: true };
+    } catch (error) {
+      console.error('Error in distributeTokensViaProxy:', error);
+      return { 
+        success: false, 
+        error: error instanceof Error ? error.message : 'Unknown error' 
+      };
+    }
+  }
+
+  // Вспомогательная функция для трансфера токенов
+  private async transferTokens(
+    mint: PublicKey,
+    fromWallet: Keypair,
+    toPublicKey: PublicKey,
+    amount: number
+  ): Promise<string> {
+    const fromTokenAccount = await getAssociatedTokenAddress(mint, fromWallet.publicKey);
+    const toTokenAccount = await getAssociatedTokenAddress(mint, toPublicKey);
+
+    // Проверяем существование целевого токен-аккаунта
+    const toAccountInfo = await this.connection.getAccountInfo(toTokenAccount);
+    const transaction = new Transaction();
+
+    // Если целевой токен-аккаунт не существует, создаем его
+    if (!toAccountInfo) {
+      transaction.add(
+        createAssociatedTokenAccountInstruction(
+          fromWallet.publicKey,
+          toTokenAccount,
+          toPublicKey,
+          mint
+        )
+      );
+    }
+
+    // Добавляем инструкцию трансфера
+    transaction.add(
+      createTransferInstruction(
+        fromTokenAccount,
+        toTokenAccount,
+        fromWallet.publicKey,
+        Math.floor(amount * Math.pow(10, 6)) // Конвертируем в минимальные единицы (6 decimals)
+      )
+    );
+
+    // Отправляем транзакцию
+    const signature = await this.sendAndConfirmTransaction(
+      transaction,
+      [fromWallet],
+      { commitment: 'confirmed' }
+    );
+
+    return signature;
+  }
+
+  /**
+   * Распределяет токены для bundle кошельков через прокси
+   * @param mint Адрес токена
+   * @param progressCallback Callback для отображения прогресса
+   */
+  async distributeBundleViaProxy(
+    mint: PublicKey,
+    progressCallback?: (text: string) => Promise<void>
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const devWallet = this.walletService.getDevWallet();
+      if (!devWallet) {
+        throw new Error('Dev wallet not found');
+      }
+
+      // Bundle кошельки (1-23)
+      const bundleWallets = Array.from({length: 23}, (_, i) => i + 1);
+      // Используем кошельки 24-25 как прокси
+      const proxyWallets = [24, 25];
+
+      if (progressCallback) {
+        await progressCallback('Начинаем распределение bundle токенов через прокси...');
+      }
+
+      return await this.distributeTokensViaProxy(
+        mint,
+        devWallet,
+        bundleWallets,
+        proxyWallets,
+        progressCallback
+      );
+    } catch (error) {
+      console.error('Error in distributeBundleViaProxy:', error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Распределяет токены для market making кошельков через прокси
+   * @param mint Адрес токена
+   * @param progressCallback Callback для отображения прогресса
+   */
+  async distributeMarketMakingViaProxy(
+    mint: PublicKey,
+    progressCallback?: (text: string) => Promise<void>
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const devWallet = this.walletService.getDevWallet();
+      if (!devWallet) {
+        throw new Error('Dev wallet not found');
+      }
+
+      // Проверяем баланс токенов на dev кошельке
+      const devTokenAccount = await getAssociatedTokenAddress(mint, devWallet.publicKey);
+      const devTokenBalance = await this.connection.getTokenAccountBalance(devTokenAccount);
+      if (!devTokenBalance?.value?.uiAmount || devTokenBalance.value.uiAmount === 0) {
+        throw new Error('No tokens found in dev wallet');
+      }
+
+      // Market making кошельки (26-100)
+      const mmWallets = Array.from({length: 75}, (_, i) => i + 26);
+      // Используем кошельки 101-105 как прокси для лучшего распределения
+      const proxyWallets = [101, 102, 103, 104, 105];
+
+      if (progressCallback) {
+        await progressCallback(`Начинаем распределение ${devTokenBalance.value.uiAmount} токенов через ${proxyWallets.length} прокси-кошельков...`);
+      }
+
+      // Распределяем токены через прокси
+      const result = await this.distributeTokensViaProxy(
+        mint,
+        devWallet,
+        mmWallets,
+        proxyWallets,
+        progressCallback
+      );
+
+      if (!result.success) {
+        throw new Error(result.error || 'Failed to distribute tokens via proxy');
+      }
+
+      return { success: true };
+    } catch (error) {
+      console.error('Error in distributeMarketMakingViaProxy:', error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Распределяет SOL с прокси-кошелька на целевые кошельки с вариацией сумм
+   * @param amount Общая сумма SOL для распределения
+   * @param proxyWalletNumber Номер прокси-кошелька
+   * @param targetWalletNumbers Массив номеров целевых кошельков
+   * @param progressCallback Callback для отображения прогресса
+   */
+  async distributeSolViaProxy(
+    amount: number,
+    proxyWalletNumber: number,
+    targetWalletNumbers: number[],
+    progressCallback?: (text: string) => Promise<void>
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const proxyWallet = await this.walletService.getWallet(proxyWalletNumber);
+      if (!proxyWallet) {
+        throw new Error(`Proxy wallet #${proxyWalletNumber} not found`);
+      }
+
+      // Проверяем баланс прокси кошелька
+      const proxyBalance = await this.getBalance(proxyWallet.publicKey);
+      const proxyBalanceInSol = proxyBalance / LAMPORTS_PER_SOL;
+      
+      // Учитываем комиссии за транзакции (0.000005 SOL * количество транзакций)
+      const totalFees = (0.000005 * targetWalletNumbers.length);
+      const requiredBalance = amount + totalFees;
+      
+      if (proxyBalanceInSol < requiredBalance) {
+        throw new Error(
+          `Insufficient balance in proxy wallet #${proxyWalletNumber}. ` +
+          `Required: ${requiredBalance.toFixed(6)} SOL (${amount.toFixed(6)} + ${totalFees.toFixed(6)} fees), ` +
+          `Available: ${proxyBalanceInSol.toFixed(6)} SOL`
+        );
+      }
+
+      // Базовая сумма на один кошелек (в лампортах для точности)
+      const baseAmountLamports = Math.floor((amount * LAMPORTS_PER_SOL) / targetWalletNumbers.length);
+      
+      // Генерируем случайные вариации и считаем общую сумму
+      const variations = targetWalletNumbers.map(() => 0.8 + Math.random() * 0.4); // от -20% до +20%
+      const totalVariation = variations.reduce((sum, v) => sum + v, 0);
+      const correctionFactor = targetWalletNumbers.length / totalVariation;
+      
+      // Корректируем вариации, чтобы сумма точно равнялась amount
+      const finalAmounts = variations.map(v => {
+        const correctedVariation = v * correctionFactor;
+        return Math.floor(baseAmountLamports * correctedVariation);
+      });
+
+      // Распределяем остаток от округления на последний кошелек
+      const totalDistributed = finalAmounts.reduce((sum, v) => sum + v, 0);
+      const remainder = (amount * LAMPORTS_PER_SOL) - totalDistributed;
+      if (remainder > 0) {
+        finalAmounts[finalAmounts.length - 1] += remainder;
+      }
+
+      // Распределяем SOL на каждый кошелек
+      for (let i = 0; i < targetWalletNumbers.length; i++) {
+        const targetWalletNumber = targetWalletNumbers[i];
+        const lamports = finalAmounts[i];
+        const solAmount = lamports / LAMPORTS_PER_SOL;
+
+        if (progressCallback) {
+          await progressCallback(`Отправка ${solAmount.toFixed(9)} SOL на кошелек #${targetWalletNumber}...`);
+        }
+
+        const targetWallet = await this.walletService.getWallet(targetWalletNumber);
+        if (!targetWallet) {
+          console.log(`Wallet #${targetWalletNumber} not found, skipping`);
+          continue;
+        }
+
+        const transaction = new Transaction().add(
+          SystemProgram.transfer({
+            fromPubkey: proxyWallet.publicKey,
+            toPubkey: targetWallet.publicKey,
+            lamports: lamports,
+          })
+        );
+
+        await this.sendAndConfirmTransaction(
+          transaction,
+          [proxyWallet],
+          { commitment: 'confirmed' }
+        );
+
+        // Увеличенная базовая задержка между транзакциями
+        await new Promise(resolve => setTimeout(resolve, 2000)); // 2 секунды между каждой транзакцией
+
+        // Дополнительная длительная задержка после каждых 5 кошельков
+        if ((i + 1) % 5 === 0) {
+          if (progressCallback) {
+            await progressCallback(`Делаем паузу для стабилизации RPC...`);
+          }
+          await new Promise(resolve => setTimeout(resolve, 5000)); // 5 секунд после каждых 5 кошельков
+        }
+
+        // Ещё более длительная задержка после каждых 10 кошельков
+        if ((i + 1) % 10 === 0) {
+          if (progressCallback) {
+            await progressCallback(`Длительная пауза для избежания ошибок RPC...`);
+          }
+          await new Promise(resolve => setTimeout(resolve, 10000)); // 10 секунд после каждых 10 кошельков
+        }
+      }
+
+      return { success: true };
+    } catch (error) {
+      console.error('Error in distributeSolViaProxy:', error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Распределяет SOL для bundle кошельков (1-23) через прокси (24)
+   * @param amount Сумма SOL для распределения
+   * @param progressCallback Callback для отображения прогресса
+   */
+  async distributeBundleSol(
+    amount: number,
+    progressCallback?: (text: string) => Promise<void>
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const PROXY_WALLET = 24;
+      const bundleWallets = Array.from({length: 23}, (_, i) => i + 1);
+
+      if (progressCallback) {
+        await progressCallback(`Начинаем распределение ${amount} SOL через прокси-кошелек #${PROXY_WALLET}...`);
+      }
+
+      return await this.distributeSolViaProxy(
+        amount,
+        PROXY_WALLET,
+        bundleWallets,
+        progressCallback
+      );
+    } catch (error) {
+      console.error('Error in distributeBundleSol:', error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
+    }
+  }
+
+  /**
+   * Распределяет SOL для market making кошельков (26-100) через прокси (25)
+   * @param amount Сумма SOL для распределения
+   * @param progressCallback Callback для отображения прогресса
+   */
+  async distributeMarketMakingSol(
+    amount: number,
+    progressCallback?: (text: string) => Promise<void>
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const PROXY_WALLET = 25;
+      const mmWallets = Array.from({length: 75}, (_, i) => i + 26);
+
+      if (progressCallback) {
+        await progressCallback(`Начинаем распределение ${amount} SOL через прокси-кошелек #${PROXY_WALLET}...`);
+      }
+
+      return await this.distributeSolViaProxy(
+        amount,
+        PROXY_WALLET,
+        mmWallets,
+        progressCallback
+      );
+    } catch (error) {
+      console.error('Error in distributeMarketMakingSol:', error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error'
+      };
     }
   }
 }
