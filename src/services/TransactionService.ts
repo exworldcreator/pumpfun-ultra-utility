@@ -31,9 +31,9 @@ export class TransactionService {
   private bundleLUT: string | null = null;
   private marketMakingLUT: string | null = null;
   
-  constructor(rpcUrl: string = 'https://api.mainnet-beta.solana.com') {
+  constructor(walletService: WalletService, rpcUrl: string = 'https://api.mainnet-beta.solana.com') {
     this.connection = new Connection(rpcUrl);
-    this.walletService = new WalletService();
+    this.walletService = walletService;
     this.walletSetService = new WalletSetService();
     this.lookupTableService = new LookupTableService(rpcUrl);
   }

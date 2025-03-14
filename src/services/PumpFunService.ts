@@ -598,4 +598,240 @@ export class PumpFunService {
       throw error;
     }
   }
+
+  /**
+   * Продаёт токены через bonding curve
+   * @param mint Адрес токена
+   * @param tokenAmount Количество токенов для продажи
+   * @param payer Кошелёк, выполняющий продажу
+   * @returns Подпись транзакции
+   */
+  async sellTokens(
+    mint: PublicKey,
+    tokenAmount: number,
+    payer: Keypair
+  ): Promise<string> {
+    try {
+      // Use the known working fee recipient
+      const feeRecipient = new PublicKey('62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV');
+      console.log('Using fee recipient:', feeRecipient.toBase58());
+
+      // Get bonding curve PDA
+      const [bondingCurvePublicKey] = await PublicKey.findProgramAddress(
+        [Buffer.from("bonding-curve"), mint.toBuffer()],
+        PUMP_FUN_PROGRAM_ID
+      );
+
+      // Get token accounts
+      const associatedUser = await getAssociatedTokenAddress(mint, payer.publicKey);
+      const associatedBondingCurve = await getAssociatedTokenAddress(
+        mint,
+        bondingCurvePublicKey,
+        true
+      );
+
+      // Проверяем состояние bonding curve
+      const bondingCurveInfo = await this.connection.getAccountInfo(bondingCurvePublicKey);
+      if (!bondingCurveInfo) {
+        throw new Error(`Bonding curve for mint ${mint.toBase58()} not found or completed`);
+      }
+
+      // Проверяем баланс токенов на ATA пользователя
+      const userTokenAccountInfo = await this.connection.getTokenAccountBalance(associatedUser);
+      if (!userTokenAccountInfo || !userTokenAccountInfo.value) {
+        throw new Error(`Token account ${associatedUser.toBase58()} not found or empty`);
+      }
+      const tokenBalance = Number(userTokenAccountInfo.value.amount);
+      const tokenDecimals = userTokenAccountInfo.value.decimals;
+      const tokenAmountLamports = BigInt(Math.floor(tokenAmount * Math.pow(10, tokenDecimals)));
+
+      if (tokenBalance < tokenAmountLamports) {
+        throw new Error(
+          `Insufficient token balance on ${associatedUser.toBase58()}. ` +
+          `Required: ${tokenAmount}, Available: ${tokenBalance / Math.pow(10, tokenDecimals)}`
+        );
+      }
+
+      // Create transaction
+      const transaction = new Transaction();
+
+      // Prepare sell instruction data
+      const sellDiscriminator = Buffer.from([51, 230, 133, 164, 1, 127, 131, 173]);
+      const amountBuffer = Buffer.alloc(8);
+      amountBuffer.writeBigUInt64LE(tokenAmountLamports);
+
+      const data = Buffer.concat([
+        sellDiscriminator,
+        amountBuffer,
+      ]);
+      console.log('Sell instruction data (hex):', data.toString('hex'));
+      console.log('tokenAmountLamports:', tokenAmountLamports.toString());
+
+      // Create sell instruction
+      const sellInstruction = new TransactionInstruction({
+        programId: PUMP_FUN_PROGRAM_ID,
+        keys: [
+          { pubkey: GLOBAL_PDA, isSigner: false, isWritable: false },              // global
+          { pubkey: feeRecipient, isSigner: false, isWritable: true },            // fee_recipient
+          { pubkey: mint, isSigner: false, isWritable: false },                   // mint
+          { pubkey: bondingCurvePublicKey, isSigner: false, isWritable: true },   // bonding_curve
+          { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },  // associated_bonding_curve
+          { pubkey: associatedUser, isSigner: false, isWritable: true },          // associated_user
+          { pubkey: payer.publicKey, isSigner: true, isWritable: true },          // user
+          { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },// system_program
+          { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },       // token_program
+          { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },     // rent
+          { pubkey: EVENT_AUTHORITY, isSigner: false, isWritable: false },        // event_authority
+          { pubkey: PUMP_FUN_PROGRAM_ID, isSigner: false, isWritable: false },    // program
+        ],
+        data,
+      });
+
+      transaction.add(sellInstruction);
+
+      // Get latest blockhash and send transaction
+      const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = payer.publicKey;
+
+      console.log('Sending sell transaction...');
+      const signature = await sendAndConfirmTransaction(
+        this.connection,
+        transaction,
+        [payer],
+        { 
+          commitment: 'confirmed',
+          skipPreflight: false,
+        }
+      );
+
+      console.log(`Token sell successful! Transaction: ${signature}`);
+      return signature;
+    } catch (error: unknown) {
+      console.error('Error selling tokens:', error);
+      if (error && typeof error === 'object' && 'logs' in error) {
+        console.error('Transaction logs:', (error as { logs: string[] }).logs);
+      }
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      throw new Error(`Failed to sell tokens: ${errorMessage}`);
+    }
+  }
+
+  /**
+   * Продает все токены со всех кошельков
+   * @param mint Адрес токена
+   * @returns Массив результатов продажи
+   */
+  async sellAllTokens(
+    mint: PublicKey,
+    progressCallback?: (text: string) => Promise<void>
+  ): Promise<{ walletNumber: number; signature?: string; error?: string }[]> {
+    const results: { walletNumber: number; signature?: string; error?: string }[] = [];
+    
+    try {
+      console.log('Starting sellAllTokens process...');
+      
+      // Продаем с bundle кошельков (1-23)
+      console.log('Processing bundle wallets (1-23)...');
+      for (let i = 1; i <= 23; i++) {
+        if (progressCallback) {
+          await progressCallback(`Проверка баланса кошелька #${i}...`);
+        }
+
+        try {
+          console.log(`Getting wallet #${i}...`);
+          const wallet = await this.walletService.getWallet(i);
+          if (!wallet) {
+            console.log(`Wallet #${i} not found, skipping`);
+            continue;
+          }
+
+          console.log(`Getting token account for wallet #${i}...`);
+          const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey);
+          
+          try {
+            console.log(`Checking token balance for wallet #${i}...`);
+            const tokenBalance = await this.connection.getTokenAccountBalance(associatedUser);
+            if (tokenBalance && tokenBalance.value.uiAmount && tokenBalance.value.uiAmount > 0) {
+              console.log(`Found ${tokenBalance.value.uiAmount} tokens in wallet #${i}`);
+              if (progressCallback) {
+                await progressCallback(`Продажа ${tokenBalance.value.uiAmount} токенов с кошелька #${i}...`);
+              }
+
+              const signature = await this.sellTokens(
+                mint,
+                tokenBalance.value.uiAmount,
+                wallet
+              );
+              
+              console.log(`Successfully sold tokens from wallet #${i}, signature: ${signature}`);
+              results.push({ walletNumber: i, signature });
+            } else {
+              console.log(`No tokens found in wallet #${i}`);
+            }
+          } catch (error) {
+            console.log(`Token account not found for wallet #${i}, skipping`);
+            continue;
+          }
+        } catch (error) {
+          console.error(`Error processing wallet #${i}:`, error);
+          results.push({ walletNumber: i, error: error instanceof Error ? error.message : 'Unknown error' });
+        }
+      }
+
+      // Продаем с market making кошельков (26-100)
+      console.log('Processing market making wallets (26-100)...');
+      for (let i = 26; i <= 100; i++) {
+        if (progressCallback) {
+          await progressCallback(`Проверка баланса кошелька #${i}...`);
+        }
+
+        try {
+          console.log(`Getting wallet #${i}...`);
+          const wallet = await this.walletService.getWallet(i);
+          if (!wallet) {
+            console.log(`Wallet #${i} not found, skipping`);
+            continue;
+          }
+
+          console.log(`Getting token account for wallet #${i}...`);
+          const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey);
+          
+          try {
+            console.log(`Checking token balance for wallet #${i}...`);
+            const tokenBalance = await this.connection.getTokenAccountBalance(associatedUser);
+            if (tokenBalance && tokenBalance.value.uiAmount && tokenBalance.value.uiAmount > 0) {
+              console.log(`Found ${tokenBalance.value.uiAmount} tokens in wallet #${i}`);
+              if (progressCallback) {
+                await progressCallback(`Продажа ${tokenBalance.value.uiAmount} токенов с кошелька #${i}...`);
+              }
+
+              const signature = await this.sellTokens(
+                mint,
+                tokenBalance.value.uiAmount,
+                wallet
+              );
+              
+              console.log(`Successfully sold tokens from wallet #${i}, signature: ${signature}`);
+              results.push({ walletNumber: i, signature });
+            } else {
+              console.log(`No tokens found in wallet #${i}`);
+            }
+          } catch (error) {
+            console.log(`Token account not found for wallet #${i}, skipping`);
+            continue;
+          }
+        } catch (error) {
+          console.error(`Error processing wallet #${i}:`, error);
+          results.push({ walletNumber: i, error: error instanceof Error ? error.message : 'Unknown error' });
+        }
+      }
+
+      console.log('sellAllTokens process completed');
+      return results;
+    } catch (error) {
+      console.error('Error in sellAllTokens:', error);
+      throw error;
+    }
+  }
 }

@@ -22,7 +22,7 @@ if (!process.env.BOT_TOKEN) {
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const walletService = new WalletService();
-const transactionService = new TransactionService();
+const transactionService = new TransactionService(walletService);
 const walletSetService = new WalletSetService();
 const pumpFunService = new PumpFunService(walletService);
 const tokenHistoryService = new TokenHistoryService();
@@ -53,7 +53,7 @@ interface BundleData {
 
 interface UserState {
   waitingForAmount?: boolean;
-  distributionType?: 'bundle' | 'marketMakers' | 'checkBalance' | 'buyToken' | 'bundleBuy';
+  distributionType?: 'bundle' | 'marketMakers' | 'checkBalance' | 'buyToken' | 'bundleBuy' | 'sell_all';
   useLookupTable?: boolean;
   step?: string;
   tokenData?: TokenData;
@@ -134,6 +134,7 @@ const WALLET_MENU_BUTTONS = {
 const LAUNCH_MENU_BUTTONS = {
   CREATE_TOKEN: '🪙 Create Token',
   BUY_TOKEN: '💸 Buy Token',
+  SELL_ALL: '💰 Sell All Tokens',
   MY_TOKENS: '📜 My Tokens',
   BACK: '⬅️ Back to Main Menu'
 };
@@ -170,7 +171,7 @@ function getWalletsMenuKeyboard() {
 function getLaunchMenuKeyboard() {
   return Markup.keyboard([
     [LAUNCH_MENU_BUTTONS.CREATE_TOKEN],
-    [LAUNCH_MENU_BUTTONS.BUY_TOKEN],
+    [LAUNCH_MENU_BUTTONS.BUY_TOKEN, LAUNCH_MENU_BUTTONS.SELL_ALL],
     [LAUNCH_MENU_BUTTONS.MY_TOKENS],
     [LAUNCH_MENU_BUTTONS.BACK]
   ]).resize();
@@ -230,6 +231,7 @@ bot.hears(MAIN_MENU_BUTTONS.LAUNCH, async (ctx) => {
                   'Here you can:\n' +
                   '• Create new tokens\n' +
                   '• Buy existing tokens\n' +
+                  '• Sell all tokens\n' +
                   '• View your tokens\n\n' +
                   'Please select an action:';
   
@@ -471,6 +473,28 @@ bot.hears(LAUNCH_MENU_BUTTONS.BUY_TOKEN, async (ctx) => {
   } catch (error) {
     console.error('Error in buy_token button:', error);
     await ctx.reply('❌ Ошибка при запуске покупки. Пожалуйста, попробуйте позже.');
+  }
+});
+
+bot.hears(LAUNCH_MENU_BUTTONS.SELL_ALL, async (ctx) => {
+  try {
+    const userId = ctx.from.id.toString();
+    console.log('Sell All button clicked by user:', userId);
+
+    await ctx.reply(
+      '📝 Введите адрес токена (mint address) для продажи со всех кошельков:'
+    );
+
+    userStates.set(userId, {
+      step: 'sell_all',
+      distributionType: 'sell_all',
+      tokenData: createEmptyTokenData()
+    });
+    
+    console.log('User state set:', userStates.get(userId));
+  } catch (error) {
+    console.error('Error in sell_all button:', error);
+    await ctx.reply('❌ Ошибка при инициализации продажи. Пожалуйста, попробуйте позже.');
   }
 });
 
@@ -1174,6 +1198,95 @@ bot.on('text', async (ctx) => {
             }
           }
           break;
+      }
+      return;
+    }
+
+    // Handle sell_all flow
+    if (userState.distributionType === 'sell_all' && userState.step === 'sell_all') {
+      try {
+        console.log('Starting sell_all process...');
+        const mintAddress = ctx.message.text.trim();
+        console.log('Mint address received:', mintAddress);
+        
+        try {
+          const mint = new PublicKey(mintAddress);
+          console.log('Mint address validated');
+
+          const message = await ctx.reply('⏳ Начинаем продажу токенов со всех кошельков...');
+          console.log('Initial message sent');
+          
+          // Ensure wallets are loaded
+          console.log('Loading wallets from set...');
+          await transactionService.loadWalletsFromSet();
+          console.log('Wallets loaded successfully');
+          
+          console.log('Starting sellAllTokens...');
+          const results = await pumpFunService.sellAllTokens(
+            mint,
+            async (progressText) => {
+              console.log('Progress update:', progressText);
+              try {
+                await ctx.telegram.editMessageText(
+                  message.chat.id,
+                  message.message_id,
+                  undefined,
+                  progressText
+                );
+              } catch (error) {
+                console.error('Error updating progress message:', error);
+              }
+            }
+          );
+          console.log('sellAllTokens completed. Results:', results);
+
+          // Подготавливаем итоговое сообщение
+          let successCount = results.filter(r => r.signature).length;
+          let failCount = results.filter(r => r.error).length;
+          let skipCount = results.length - successCount - failCount;
+
+          let resultMessage = '📊 Результаты продажи токенов:\n\n';
+          resultMessage += `✅ Успешно продано: ${successCount}\n`;
+          resultMessage += `❌ Ошибок: ${failCount}\n`;
+          resultMessage += `⏭️ Пропущено (нет токенов): ${skipCount}\n\n`;
+          
+          if (successCount > 0) {
+            resultMessage += '🔍 Успешные транзакции:\n';
+            results.forEach(result => {
+              if (result.signature) {
+                resultMessage += `Кошелек #${result.walletNumber}: https://solscan.io/tx/${result.signature}\n`;
+              }
+            });
+          }
+
+          if (failCount > 0) {
+            resultMessage += '\n❌ Ошибки:\n';
+            results.forEach(result => {
+              if (result.error) {
+                resultMessage += `Кошелек #${result.walletNumber}: ${result.error}\n`;
+              }
+            });
+          }
+
+          resultMessage += `\n🔗 Токен: https://pump.fun/token/${mintAddress}`;
+
+          await ctx.telegram.editMessageText(
+            message.chat.id,
+            message.message_id,
+            undefined,
+            resultMessage
+          );
+
+          // Очищаем состояние пользователя
+          userStates.delete(userId);
+        } catch (error) {
+          console.error('Error validating mint address:', error);
+          await ctx.reply('❌ Ошибка: Неверный адрес токена. Пожалуйста, проверьте адрес и попробуйте снова.');
+        }
+      } catch (error) {
+        console.error('Error in sell_all step:', error);
+        await ctx.reply('❌ Произошла ошибка при продаже токенов. Пожалуйста, попробуйте позже.');
+        userStates.delete(userId);
       }
       return;
     }

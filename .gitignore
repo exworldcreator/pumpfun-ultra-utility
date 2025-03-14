@@ -34,4 +34,4 @@ Thumbs.db
 
 # Database
 *.sql
-*.dump 
+*.dump db/wallet-sets.json

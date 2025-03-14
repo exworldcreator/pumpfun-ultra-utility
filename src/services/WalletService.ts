@@ -4,7 +4,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { LookupTableService } from './LookupTableService';
 import csvParser from 'csv-parser';
-import { DatabaseService } from './DatabaseService';
 
 export interface WalletData {
   publicKey: string;
@@ -33,15 +32,15 @@ interface WalletSetData {
 }
 
 export class WalletService {
-  private db: DatabaseService;
   private devWallet: Keypair | null = null;
   private devWalletPublicKey: string | null = null;
   private walletsPath: string;
   private wallets: Map<number, Keypair> = new Map();
+  private lookupTableService: LookupTableService;
 
   constructor() {
-    this.db = DatabaseService.getInstance();
     this.walletsPath = path.join(__dirname, '../../wallets.json');
+    this.lookupTableService = new LookupTableService();
     this.loadWallets();
   }
 
@@ -151,8 +150,6 @@ export class WalletService {
       this.devWalletPublicKey = wallet.publicKey.toString();
       console.log('Dev wallet set in WalletService:', wallet.publicKey.toString());
     }
-    // Сохраняем или обновляем dev wallet в базе
-    await this.saveWalletToDb(0, wallet, 'dev');
   }
 
   /**
@@ -307,41 +304,5 @@ export class WalletService {
 
   public getAllWallets(): Map<number, Keypair> {
     return this.wallets;
-  }
-
-  private async saveWalletToDb(
-    walletNumber: number,
-    keypair: Keypair,
-    walletType: 'dev' | 'bundle' | 'market_making'
-  ) {
-    const query = `
-      INSERT INTO wallets (wallet_number, public_key, private_key, wallet_type)
-      VALUES ($1, $2, $3, $4)
-      ON CONFLICT (wallet_number) 
-      DO UPDATE SET 
-        public_key = EXCLUDED.public_key,
-        private_key = EXCLUDED.private_key,
-        wallet_type = EXCLUDED.wallet_type
-      RETURNING id;
-    `;
-
-    const values = [
-      walletNumber,
-      keypair.publicKey.toString(),
-      Buffer.from(keypair.secretKey).toString('base64'),
-      walletType
-    ];
-
-    await this.db.query(query, values);
-  }
-
-  async getAllWallets() {
-    const query = 'SELECT wallet_number, public_key, wallet_type FROM wallets ORDER BY wallet_number';
-    return await this.db.query(query);
-  }
-
-  async getWalletsByType(type: 'bundle' | 'market_making') {
-    const query = 'SELECT wallet_number, public_key FROM wallets WHERE wallet_type = $1 ORDER BY wallet_number';
-    return await this.db.query(query, [type]);
   }
 } 
