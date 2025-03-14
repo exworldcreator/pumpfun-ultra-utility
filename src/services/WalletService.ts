@@ -32,6 +32,19 @@ interface WalletSetData {
   }[];
 }
 
+interface WalletSetWallet {
+  NUMBER: string;
+  TYPE: string;
+  PUBLIC_KEY: string;
+  PRIVATE_KEY: string;
+}
+
+interface WalletSet {
+  id: string;
+  createdAt: Date;
+  wallets: WalletSetWallet[];
+}
+
 export class WalletService {
   private devWallet: Keypair | null = null;
   private devWalletPublicKey: string | null = null;
@@ -40,12 +53,18 @@ export class WalletService {
   private lookupTableService: LookupTableService;
   private dbService: DatabaseService;
   private useDatabase: boolean = true;
+  private activeWalletSetId: string | null = null;
 
-  constructor() {
+  private constructor() {
     this.walletsPath = path.join(__dirname, '../../wallets.json');
     this.lookupTableService = new LookupTableService();
     this.dbService = DatabaseService.getInstance();
-    this.loadWallets();
+  }
+
+  public static async initialize(): Promise<WalletService> {
+    const service = new WalletService();
+    await service.loadWallets();
+    return service;
   }
 
   private async loadWallets() {
@@ -57,12 +76,7 @@ export class WalletService {
       }
     } catch (error) {
       console.error('Error loading wallets:', error);
-      // Если не удалось загрузить из базы данных, пробуем загрузить из файлов
-      if (this.useDatabase) {
-        console.log('Falling back to loading wallets from files...');
-        this.useDatabase = false;
-        this.loadWalletsFromFiles();
-      }
+      throw error;
     }
   }
 
@@ -80,23 +94,27 @@ export class WalletService {
       `);
       
       if (!tableExists.rows[0].exists) {
-        console.log('Wallets table does not exist in the database. Falling back to files.');
-        this.useDatabase = false;
-        this.loadWalletsFromFiles();
-        return;
+        console.log('Wallets table does not exist in the database. Creating it...');
+        const sqlFilePath = path.join(__dirname, '../db/migrations/001_create_wallets_table.sql');
+        const sqlScript = fs.readFileSync(sqlFilePath, 'utf8');
+        await this.dbService.query(sqlScript);
+        
+        // Если таблица только что создана, инициализируем её данными из файлов
+        await this.initializeDatabaseFromFiles();
       }
       
       // Получаем все кошельки из базы данных
-      const result = await this.dbService.query('SELECT * FROM wallets ORDER BY wallet_number');
+      let result = await this.dbService.query('SELECT * FROM wallets ORDER BY wallet_number');
       
       if (result.rows.length === 0) {
-        console.log('No wallets found in the database. Falling back to files.');
-        this.useDatabase = false;
-        this.loadWalletsFromFiles();
-        return;
+        console.log('No wallets found in the database. Initializing from files...');
+        await this.initializeDatabaseFromFiles();
+        // Повторно получаем кошельки после инициализации
+        result = await this.dbService.query('SELECT * FROM wallets ORDER BY wallet_number');
       }
       
       // Загружаем кошельки в память
+      this.wallets.clear();
       result.rows.forEach(row => {
         const secretKey = Buffer.from(row.private_key, 'base64');
         const keypair = Keypair.fromSecretKey(secretKey);
@@ -116,33 +134,105 @@ export class WalletService {
     }
   }
 
+  private async initializeDatabaseFromFiles() {
+    // Загружаем кошельки из файлов
+    this.loadWalletsFromFiles();
+    
+    // Сохраняем их в базу данных
+    const client = await this.dbService.getClient();
+    try {
+      await client.query('BEGIN');
+      
+      // Очищаем таблицу перед вставкой
+      await client.query('DELETE FROM wallets');
+      
+      // Вставляем данные в базу данных
+      for (const [indexStr, keypair] of this.wallets.entries()) {
+        const index = Number(indexStr);
+        let type: WalletData['type'];
+        if (index === 0) type = 'dev';
+        else if (index >= 1 && index <= 23) type = 'bundle';
+        else if (index === 24) type = 'bundle_payer';
+        else if (index === 25) type = 'market_maker_payer';
+        else type = 'market_maker';
+        
+        await client.query(
+          `INSERT INTO wallets (wallet_number, public_key, private_key, wallet_type) 
+           VALUES ($1, $2, $3, $4)`,
+          [
+            index,
+            keypair.publicKey.toString(),
+            Buffer.from(keypair.secretKey).toString('base64'),
+            type
+          ]
+        );
+      }
+      
+      await client.query('COMMIT');
+      console.log('Successfully initialized database from files');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      console.error('Error initializing database from files:', error);
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   private loadWalletsFromFiles() {
     try {
-      // Try to load from wallet sets first
+      // Try to load dev wallet first
+      const devWalletPath = path.join(__dirname, '../../dev-wallet.json');
+      if (fs.existsSync(devWalletPath)) {
+        const devWalletData = JSON.parse(fs.readFileSync(devWalletPath, 'utf8'));
+        const secretKey = Buffer.from(devWalletData.privateKey, 'base64');
+        const devKeypair = Keypair.fromSecretKey(secretKey);
+        this.devWallet = devKeypair;
+        this.devWalletPublicKey = devKeypair.publicKey.toString();
+        this.wallets.set(0, devKeypair);
+      }
+
+      // Try to load from wallet sets
       const walletSetsPath = path.join(__dirname, '../../db/wallet-sets.json');
       if (fs.existsSync(walletSetsPath)) {
         const data = fs.readFileSync(walletSetsPath, 'utf8');
         const sets = JSON.parse(data) as Record<string, WalletSetData>;
         
-        // Get the most recent set
-        const mostRecentSet = Object.values(sets)
-          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
+        let targetSet: WalletSetData | null = null;
+
+        if (this.activeWalletSetId && sets[this.activeWalletSetId]) {
+          // Load the selected wallet set
+          targetSet = sets[this.activeWalletSetId];
+          console.log(`Loading wallet set ${this.activeWalletSetId}`);
+        } else {
+          // Get the most recent set if no specific set is selected
+          targetSet = Object.values(sets)
+            .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
+          if (targetSet) {
+            this.activeWalletSetId = targetSet.id;
+            console.log(`No wallet set selected, using most recent set ${targetSet.id}`);
+          }
+        }
         
-        if (mostRecentSet && mostRecentSet.wallets) {
-          mostRecentSet.wallets.forEach(walletData => {
+        if (targetSet && targetSet.wallets) {
+          // Clear existing wallets except dev wallet
+          const devWallet = this.wallets.get(0);
+          this.wallets.clear();
+          if (devWallet) {
+            this.wallets.set(0, devWallet);
+          }
+
+          targetSet.wallets.forEach(walletData => {
             const index = parseInt(walletData.NUMBER, 10);
-            const secretKey = Buffer.from(walletData.PRIVATE_KEY, 'base64');
-            const keypair = Keypair.fromSecretKey(secretKey);
-            this.wallets.set(index, keypair);
-            
-            // If this is dev wallet (index 0), set it
-            if (index === 0) {
-              this.devWallet = keypair;
-              this.devWalletPublicKey = keypair.publicKey.toString();
+            // Skip dev wallet (index 0) to preserve the original
+            if (index !== 0) {
+              const secretKey = Buffer.from(walletData.PRIVATE_KEY, 'base64');
+              const keypair = Keypair.fromSecretKey(secretKey);
+              this.wallets.set(index, keypair);
             }
           });
           
-          console.log(`Loaded ${this.wallets.size} wallets from the most recent wallet set`);
+          console.log(`Loaded ${this.wallets.size} wallets from wallet set ${targetSet.id}`);
           return;
         }
       }
@@ -152,14 +242,19 @@ export class WalletService {
         const data = fs.readFileSync(this.walletsPath, 'utf8');
         const walletsData: WalletData[] = JSON.parse(data);
         
+        // Keep dev wallet if exists
+        const devWallet = this.wallets.get(0);
+        this.wallets.clear();
+        if (devWallet) {
+          this.wallets.set(0, devWallet);
+        }
+
         walletsData.forEach(walletData => {
-          const secretKey = Buffer.from(walletData.privateKey, 'base64');
-          const keypair = Keypair.fromSecretKey(secretKey);
-          this.wallets.set(walletData.index, keypair);
-          
-          if (walletData.index === 0) {
-            this.devWallet = keypair;
-            this.devWalletPublicKey = keypair.publicKey.toString();
+          // Skip dev wallet to preserve the original
+          if (walletData.index !== 0) {
+            const secretKey = Buffer.from(walletData.privateKey, 'base64');
+            const keypair = Keypair.fromSecretKey(secretKey);
+            this.wallets.set(walletData.index, keypair);
           }
         });
         
@@ -511,5 +606,78 @@ export class WalletService {
 
   public getAllWallets(): Map<number, Keypair> {
     return this.wallets;
+  }
+
+  /**
+   * Gets a specific wallet set by ID
+   * @param setId The ID of the wallet set to retrieve
+   * @returns The wallet set data or null if not found
+   */
+  private getWalletSet(setId: string): WalletSet | null {
+    const walletSetsPath = path.join(__dirname, '../../db/wallet-sets.json');
+    if (!fs.existsSync(walletSetsPath)) {
+      return null;
+    }
+
+    const data = fs.readFileSync(walletSetsPath, 'utf8');
+    const sets = JSON.parse(data) as Record<string, WalletSet>;
+    return sets[setId] || null;
+  }
+
+  /**
+   * Sets the active wallet set and reloads wallets
+   * @param setId The ID of the wallet set to activate
+   */
+  public async setActiveWalletSet(setId: string): Promise<void> {
+    this.activeWalletSetId = setId;
+    
+    // Get the wallet set data
+    const set = this.getWalletSet(setId);
+    if (!set || !set.wallets) {
+      throw new Error(`Wallet set ${setId} not found or has no wallets`);
+    }
+    
+    // Load all wallets from the set, preserving dev wallet
+    await this.loadWallets();
+  }
+
+  /**
+   * Gets the ID of the currently active wallet set
+   * @returns The ID of the active wallet set or null if none is selected
+   */
+  public getActiveWalletSetId(): string | null {
+    return this.activeWalletSetId;
+  }
+
+  /**
+   * Reloads all wallets from the current source (database or files)
+   */
+  public async reloadWallets(): Promise<void> {
+    await this.loadWallets();
+  }
+
+  public async selectWalletSet(setName: string): Promise<void> {
+    try {
+      const walletSets = JSON.parse(fs.readFileSync('./db/wallet-sets.json', 'utf-8'));
+      const selectedSet = walletSets[setName];
+      
+      if (!selectedSet) {
+        throw new Error(`Wallet set ${setName} not found`);
+      }
+
+      // Load wallets from the selected set
+      this.wallets.clear();
+      for (const wallet of selectedSet.wallets) {
+        const keypair = Keypair.fromSecretKey(
+          Buffer.from(wallet.PRIVATE_KEY, 'base64')
+        );
+        this.wallets.set(parseInt(wallet.NUMBER), keypair);
+      }
+
+      console.log(`Successfully loaded wallet set ${setName}`);
+    } catch (error) {
+      console.error(`Error selecting wallet set ${setName}:`, error);
+      throw error;
+    }
   }
 } 

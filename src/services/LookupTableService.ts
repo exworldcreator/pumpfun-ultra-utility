@@ -78,12 +78,21 @@ export class LookupTableService {
       // Create transaction to create the LUT
       const createTransaction = new Transaction().add(createInstruction);
       
+      // Получаем актуальный блокхеш перед отправкой транзакции
+      const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
+      createTransaction.recentBlockhash = blockhash;
+      createTransaction.lastValidBlockHeight = lastValidBlockHeight;
+      
       // Send and confirm the transaction
       const createSignature = await sendAndConfirmTransaction(
         this.connection,
         createTransaction,
         [payerWallet],
-        { commitment: 'confirmed' }
+        { 
+          commitment: 'confirmed' as const,
+          skipPreflight: false,
+          maxRetries: 5
+        }
       );
       
       console.log(`Created lookup table: ${lookupTableAddress.toBase58()}`);
@@ -110,11 +119,20 @@ export class LookupTableService {
         const extendTransaction = new Transaction().add(extendInstruction);
         
         try {
+          // Получаем актуальный блокхеш перед отправкой транзакции
+          const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
+          extendTransaction.recentBlockhash = blockhash;
+          extendTransaction.lastValidBlockHeight = lastValidBlockHeight;
+          
           const extendSignature = await sendAndConfirmTransaction(
             this.connection,
             extendTransaction,
             [payerWallet],
-            { commitment: 'confirmed' }
+            { 
+              commitment: 'confirmed' as const,
+              skipPreflight: false,
+              maxRetries: 5
+            }
           );
           
           console.log(`Extended lookup table with ${batch.length} addresses`);

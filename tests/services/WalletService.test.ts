@@ -20,29 +20,14 @@ describe('WalletService', () => {
     } as QueryResult<T>;
   }
   
-  beforeEach(() => {
+  beforeEach(async () => {
+    walletService = await WalletService.initialize();
+    
     // Создаем заглушку для DatabaseService
     dbServiceStub = sinon.createStubInstance(DatabaseService);
     
     // Подменяем getInstance, чтобы возвращал нашу заглушку
     sinon.stub(DatabaseService, 'getInstance').returns(dbServiceStub as any);
-    
-    // Создаем WalletService
-    walletService = new WalletService();
-    
-    // Подменяем приватные методы, чтобы они не обращались к файловой системе
-    sinon.stub(walletService as any, 'loadWalletsFromFiles').callsFake(function() {
-      const testWallet1 = Keypair.generate();
-      const testWallet2 = Keypair.generate();
-      
-      this.wallets.set(0, testWallet1);
-      this.wallets.set(1, testWallet2);
-      
-      this.devWallet = testWallet1;
-      this.devWalletPublicKey = testWallet1.publicKey.toString();
-    });
-    
-    sinon.stub(walletService as any, 'saveWalletsToFiles').returns(undefined);
     
     // Настраиваем заглушки для базы данных
     dbServiceStub.query.withArgs(sinon.match(/SELECT EXISTS/)).resolves(createQueryResult([{ exists: false }]));

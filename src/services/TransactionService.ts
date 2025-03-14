@@ -24,6 +24,8 @@ interface CsvWalletData {
 }
 
 export class TransactionService {
+  private rpcUrls: string[];
+  private currentRpcIndex: number;
   private connection: Connection;
   private walletService: WalletService;
   private walletSetService: WalletSetService;
@@ -31,11 +33,29 @@ export class TransactionService {
   private bundleLUT: string | null = null;
   private marketMakingLUT: string | null = null;
   
-  constructor(walletService: WalletService, rpcUrl: string = 'https://api.mainnet-beta.solana.com') {
-    this.connection = new Connection(rpcUrl);
+  constructor(
+    walletService: WalletService, 
+    rpcUrl: string = 'https://api.mainnet-beta.solana.com'
+  ) {
+    // List of RPC endpoints to use (add your actual endpoints here)
+    this.rpcUrls = [
+      rpcUrl,
+      'https://mainnet.helius-rpc.com/?api-key=3a000b3a-3d3b-4e41-9b30-c75d439068f1',
+      'https://solana-mainnet.g.alchemy.com/v2/demo',  // Replace with actual API key
+      'https://api.mainnet-beta.solana.com'
+    ];
+    this.currentRpcIndex = 0;
+    this.connection = new Connection(this.rpcUrls[this.currentRpcIndex]);
     this.walletService = walletService;
     this.walletSetService = new WalletSetService();
-    this.lookupTableService = new LookupTableService(rpcUrl);
+    this.lookupTableService = new LookupTableService(this.rpcUrls[this.currentRpcIndex]);
+  }
+
+  private switchToNextRPC(): void {
+    this.currentRpcIndex = (this.currentRpcIndex + 1) % this.rpcUrls.length;
+    console.log(`Switching to RPC endpoint: ${this.rpcUrls[this.currentRpcIndex]}`);
+    this.connection = new Connection(this.rpcUrls[this.currentRpcIndex]);
+    this.lookupTableService = new LookupTableService(this.rpcUrls[this.currentRpcIndex]);
   }
 
   public setLookupTableAddresses(bundleLUT: string, marketMakingLUT: string) {
@@ -43,12 +63,30 @@ export class TransactionService {
     this.marketMakingLUT = marketMakingLUT;
   }
 
-  public async getDevWalletBalance(publicKey: string): Promise<number> {
+  public async getBundlePayerBalance(): Promise<number> {
     try {
-      const balance = await this.connection.getBalance(new PublicKey(publicKey));
+      const bundlePayer = this.walletService.getWalletByIndex(24);
+      if (!bundlePayer) {
+        throw new Error('Bundle payer wallet (#24) not found');
+      }
+      const balance = await this.connection.getBalance(bundlePayer.publicKey);
       return balance / LAMPORTS_PER_SOL;
     } catch (error) {
-      console.error('Error getting dev wallet balance:', error);
+      console.error('Error getting bundle payer wallet balance:', error);
+      throw error;
+    }
+  }
+
+  public async getMarketMakingPayerBalance(): Promise<number> {
+    try {
+      const marketMakingPayer = this.walletService.getWalletByIndex(25);
+      if (!marketMakingPayer) {
+        throw new Error('Market making payer wallet (#25) not found');
+      }
+      const balance = await this.connection.getBalance(marketMakingPayer.publicKey);
+      return balance / LAMPORTS_PER_SOL;
+    } catch (error) {
+      console.error('Error getting market making payer wallet balance:', error);
       throw error;
     }
   }
@@ -68,8 +106,15 @@ export class TransactionService {
   }
 
   public async loadWalletsFromSet(): Promise<void> {
-    // Wallets are already loaded in WalletService constructor
-    console.log('Wallets are already loaded from JSON');
+    // Перезагружаем кошельки из базы данных или активного сета
+    await this.walletService.reloadWallets();
+  }
+
+  private getRandomizedAmount(baseAmount: number): number {
+    // Generate random variation between -20% and +20%
+    const variation = 0.2; // 20%
+    const randomFactor = 1 + (Math.random() * variation * 2 - variation);
+    return Math.floor(baseAmount * randomFactor);
   }
 
   public async distributeToBundle(
@@ -85,33 +130,96 @@ export class TransactionService {
       }
 
       const totalAmount = amount * LAMPORTS_PER_SOL;
-      const amountPerWallet = Math.floor(totalAmount / 23);
+      const baseAmountPerWallet = Math.floor(totalAmount / 23);
 
-      for (let i = 1; i <= 23; i++) {
-        const targetWallet = this.walletService.getWalletByIndex(i);
-        if (!targetWallet) {
-          throw new Error(`Target wallet #${i} not found`);
+      // Calculate total remaining amount to distribute
+      let remainingAmount = totalAmount;
+      const walletAmounts: { [key: number]: number } = {};
+
+      // First pass: assign randomized amounts to all wallets except the last one
+      for (let i = 1; i < 23; i++) {
+        const randomizedAmount = this.getRandomizedAmount(baseAmountPerWallet);
+        walletAmounts[i] = randomizedAmount;
+        remainingAmount -= randomizedAmount;
+      }
+      // Last wallet gets the remaining amount to ensure total is correct
+      walletAmounts[23] = remainingAmount;
+
+      // Process in batches of 5 transactions
+      const BATCH_SIZE = 5;
+      for (let i = 1; i <= 23; i += BATCH_SIZE) {
+        const batchPromises = [];
+        const endIndex = Math.min(i + BATCH_SIZE - 1, 23);
+
+        for (let j = i; j <= endIndex; j++) {
+          const targetWallet = this.walletService.getWalletByIndex(j);
+          if (!targetWallet) {
+            throw new Error(`Target wallet #${j} not found`);
+          }
+
+          const actualAmount = walletAmounts[j];
+          if (progressCallback) {
+            await progressCallback(`Отправка ${actualAmount / LAMPORTS_PER_SOL} SOL на кошелек #${j}...`);
+          }
+
+          const sendTransaction = async () => {
+            const transaction = new Transaction().add(
+              SystemProgram.transfer({
+                fromPubkey: bundlePayer.publicKey,
+                toPubkey: targetWallet.publicKey,
+                lamports: actualAmount
+              })
+            );
+
+            return this.retryWithBackoff(async () => {
+              try {
+                const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
+                transaction.recentBlockhash = blockhash;
+                transaction.lastValidBlockHeight = lastValidBlockHeight;
+
+                const confirmOptions = {
+                  skipPreflight: false,
+                  commitment: 'confirmed' as const,
+                  preflightCommitment: 'confirmed' as const,
+                  maxRetries: 5
+                };
+
+                return await sendAndConfirmTransaction(
+                  this.connection,
+                  transaction,
+                  [bundlePayer],
+                  confirmOptions
+                );
+              } catch (error) {
+                if (error instanceof Error) {
+                  if (error.message.includes('429 Too Many Requests')) {
+                    throw error;
+                  } else if (error.message.includes('insufficient funds')) {
+                    throw new Error(`Insufficient funds in wallet #24 for distribution to wallet #${j}`);
+                  } else if (error.message.includes('blockhash not found')) {
+                    this.switchToNextRPC();
+                    throw error;
+                  }
+                }
+                throw error;
+              }
+            }, 5, 1000);
+          };
+
+          batchPromises.push(sendTransaction());
         }
 
-        if (progressCallback) {
-          await progressCallback(`Отправка ${amount / 23} SOL на кошелек #${i}...`);
+        try {
+          const batchSignatures = await Promise.all(batchPromises);
+          signatures.push(...batchSignatures);
+
+          if (i + BATCH_SIZE <= 23) {
+            await this.sleep(2000);
+          }
+        } catch (error) {
+          console.error(`Error processing batch ${i}-${endIndex}:`, error);
+          throw error;
         }
-
-        const transaction = new Transaction().add(
-          SystemProgram.transfer({
-            fromPubkey: bundlePayer.publicKey,
-            toPubkey: targetWallet.publicKey,
-            lamports: amountPerWallet
-          })
-        );
-
-        const signature = await sendAndConfirmTransaction(
-          this.connection,
-          transaction,
-          [bundlePayer]
-        );
-
-        signatures.push(signature);
       }
 
       return signatures;
@@ -119,6 +227,44 @@ export class TransactionService {
       console.error('Error in distributeToBundle:', error);
       throw error;
     }
+  }
+
+  private async sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  private async retryWithBackoff<T>(
+    operation: () => Promise<T>,
+    maxRetries: number = 5,
+    baseDelay: number = 500
+  ): Promise<T> {
+    let lastError: Error | unknown;
+    let rpcRetries = 0;
+    const maxRpcRetries = this.rpcUrls.length;
+
+    for (let i = 0; i < maxRetries; i++) {
+      try {
+        return await operation();
+      } catch (error: unknown) {
+        lastError = error;
+        if (error instanceof Error) {
+          // If we hit rate limits, try switching RPC endpoints
+          if (error.message.includes('429 Too Many Requests')) {
+            if (rpcRetries < maxRpcRetries) {
+              this.switchToNextRPC();
+              rpcRetries++;
+              continue;
+            }
+          }
+          // For other errors or if we've tried all RPCs, use exponential backoff
+          const delay = baseDelay * Math.pow(2, i);
+          await this.sleep(delay);
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw lastError;
   }
 
   public async distributeToMarketMakers(
@@ -135,33 +281,96 @@ export class TransactionService {
       }
 
       const totalAmount = amount * LAMPORTS_PER_SOL;
-      const amountPerWallet = Math.floor(totalAmount / 75);
+      const baseAmountPerWallet = Math.floor(totalAmount / 75);
 
-      for (let i = 26; i <= 100; i++) {
-        const targetWallet = this.walletService.getWalletByIndex(i);
-        if (!targetWallet) {
-          throw new Error(`Target wallet #${i} not found`);
+      // Calculate total remaining amount to distribute
+      let remainingAmount = totalAmount;
+      const walletAmounts: { [key: number]: number } = {};
+
+      // First pass: assign randomized amounts to all wallets except the last one
+      for (let i = 26; i < 100; i++) {
+        const randomizedAmount = this.getRandomizedAmount(baseAmountPerWallet);
+        walletAmounts[i] = randomizedAmount;
+        remainingAmount -= randomizedAmount;
+      }
+      // Last wallet gets the remaining amount to ensure total is correct
+      walletAmounts[100] = remainingAmount;
+
+      // Process in batches of 5 transactions
+      const BATCH_SIZE = 5;
+      for (let i = 26; i <= 100; i += BATCH_SIZE) {
+        const batchPromises = [];
+        const endIndex = Math.min(i + BATCH_SIZE - 1, 100);
+
+        for (let j = i; j <= endIndex; j++) {
+          const targetWallet = this.walletService.getWalletByIndex(j);
+          if (!targetWallet) {
+            throw new Error(`Target wallet #${j} not found`);
+          }
+
+          const actualAmount = walletAmounts[j];
+          if (progressCallback) {
+            await progressCallback(`Отправка ${actualAmount / LAMPORTS_PER_SOL} SOL на кошелек #${j}...`);
+          }
+
+          const sendTransaction = async () => {
+            const transaction = new Transaction().add(
+              SystemProgram.transfer({
+                fromPubkey: marketMakingPayer.publicKey,
+                toPubkey: targetWallet.publicKey,
+                lamports: actualAmount
+              })
+            );
+
+            return this.retryWithBackoff(async () => {
+              try {
+                const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
+                transaction.recentBlockhash = blockhash;
+                transaction.lastValidBlockHeight = lastValidBlockHeight;
+
+                const confirmOptions = {
+                  skipPreflight: false,
+                  commitment: 'confirmed' as const,
+                  preflightCommitment: 'confirmed' as const,
+                  maxRetries: 5
+                };
+
+                return await sendAndConfirmTransaction(
+                  this.connection,
+                  transaction,
+                  [marketMakingPayer],
+                  confirmOptions
+                );
+              } catch (error) {
+                if (error instanceof Error) {
+                  if (error.message.includes('429 Too Many Requests')) {
+                    throw error;
+                  } else if (error.message.includes('insufficient funds')) {
+                    throw new Error(`Insufficient funds in wallet #25 for distribution to wallet #${j}`);
+                  } else if (error.message.includes('blockhash not found')) {
+                    this.switchToNextRPC();
+                    throw error;
+                  }
+                }
+                throw error;
+              }
+            }, 5, 1000);
+          };
+
+          batchPromises.push(sendTransaction());
         }
 
-        if (progressCallback) {
-          await progressCallback(`Отправка ${amount / 75} SOL на кошелек #${i}...`);
+        try {
+          const batchSignatures = await Promise.all(batchPromises);
+          signatures.push(...batchSignatures);
+
+          if (i + BATCH_SIZE <= 100) {
+            await this.sleep(2000);
+          }
+        } catch (error) {
+          console.error(`Error processing batch ${i}-${endIndex}:`, error);
+          throw error;
         }
-
-        const transaction = new Transaction().add(
-          SystemProgram.transfer({
-            fromPubkey: marketMakingPayer.publicKey,
-            toPubkey: targetWallet.publicKey,
-            lamports: amountPerWallet
-          })
-        );
-
-        const signature = await sendAndConfirmTransaction(
-          this.connection,
-          transaction,
-          [marketMakingPayer]
-        );
-
-        signatures.push(signature);
       }
 
       return signatures;

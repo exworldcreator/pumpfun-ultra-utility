@@ -21,11 +21,45 @@ if (!process.env.BOT_TOKEN) {
 }
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
-const walletService = new WalletService();
-const transactionService = new TransactionService(walletService);
-const walletSetService = new WalletSetService();
-const pumpFunService = new PumpFunService(walletService);
-const tokenHistoryService = new TokenHistoryService();
+let walletService: WalletService;
+let transactionService: TransactionService;
+let walletSetService: WalletSetService;
+let pumpFunService: PumpFunService;
+let tokenHistoryService: TokenHistoryService;
+
+// Инициализация сервисов
+async function initializeServices() {
+  walletService = await WalletService.initialize();
+  transactionService = new TransactionService(walletService);
+  walletSetService = new WalletSetService();
+  pumpFunService = new PumpFunService(walletService);
+  tokenHistoryService = new TokenHistoryService();
+}
+
+// Запускаем бота только после инициализации сервисов
+async function startBot() {
+  try {
+    await initializeServices();
+    
+    // Обработчики команд бота
+    // ... existing code ...
+    
+    // Запускаем бота
+    bot.launch();
+    
+    // Enable graceful stop
+    process.once('SIGINT', () => bot.stop('SIGINT'));
+    process.once('SIGTERM', () => bot.stop('SIGTERM'));
+    
+    console.log('Bot started successfully');
+  } catch (error) {
+    console.error('Error starting bot:', error);
+    process.exit(1);
+  }
+}
+
+// Запускаем бота
+startBot();
 
 interface TokenData {
   name: string;
@@ -68,47 +102,15 @@ type MessageContext = Context<Update> & {
 
 const userStates = new Map<string, UserState>();
 
-// Create dev wallet
-async function createDevWallet() {
-  console.log('Creating new dev wallet...');
-  const keypair = Keypair.generate();
-  const wallet = {
-    publicKey: keypair.publicKey.toString(),
-    privateKey: Buffer.from(keypair.secretKey).toString('base64')
-  };
-  
-  // Save wallet to file
-  fs.writeFileSync(path.join(__dirname, '../../dev-wallet.json'), JSON.stringify(wallet, null, 2));
-  
-  // Set in wallet service
-  walletService.setDevWallet(keypair);
-  
-  return wallet;
-}
-
-// Initialize dev wallet
-async function initDevWallet() {
-  const walletPath = path.join(__dirname, '../../dev-wallet.json');
-  
-  try {
-    if (fs.existsSync(walletPath)) {
-      console.log('Loading existing dev wallet...');
-      const wallet = JSON.parse(fs.readFileSync(walletPath, 'utf8'));
-      const secretKey = Buffer.from(wallet.privateKey, 'base64');
-      const keypair = Keypair.fromSecretKey(secretKey);
-      walletService.setDevWallet(keypair);
-      return wallet;
-    }
-  } catch (error) {
-    console.error('Error loading dev wallet:', error);
-  }
-  
-  return createDevWallet();
-}
-
 // Add debug middleware to log all updates
 bot.use((ctx, next) => {
-  console.log('Received update:', JSON.stringify(ctx.update, null, 2));
+  const update = ctx.update;
+  console.log('Received update:', JSON.stringify(update, null, 2));
+  if ('message' in update && 'text' in update.message) {
+    console.log('Message text:', update.message.text);
+    console.log('SELECT_SET button text:', WALLET_MENU_BUTTONS.SELECT_SET);
+    console.log('Text match:', update.message.text === WALLET_MENU_BUTTONS.SELECT_SET);
+  }
   return next();
 });
 
@@ -127,6 +129,7 @@ const WALLET_MENU_BUTTONS = {
   CHECK_BALANCE: '💳 Check Balance',
   DEV_WALLET: '🔑 Dev Wallet Info',
   WALLET_SETS: '📚 Wallet Sets',
+  SELECT_SET: '🎯 Select Wallet Set',
   BACK: '⬅️ Back to Main Menu'
 };
 
@@ -162,7 +165,7 @@ function getWalletsMenuKeyboard() {
     [WALLET_MENU_BUTTONS.CREATE_WALLETS],
     [WALLET_MENU_BUTTONS.DISTRIBUTE_BUNDLE, WALLET_MENU_BUTTONS.DISTRIBUTE_MARKET],
     [WALLET_MENU_BUTTONS.CHECK_BALANCE, WALLET_MENU_BUTTONS.DEV_WALLET],
-    [WALLET_MENU_BUTTONS.WALLET_SETS],
+    [WALLET_MENU_BUTTONS.WALLET_SETS, WALLET_MENU_BUTTONS.SELECT_SET],
     [WALLET_MENU_BUTTONS.BACK]
   ]).resize();
 }
@@ -192,11 +195,14 @@ bot.command('start', async (ctx) => {
   console.log('Received start command from:', ctx.from?.username);
   
   try {
-    // 1. Initialize dev wallet
-    const wallet = await initDevWallet();
-    const balance = await transactionService.getDevWalletBalance(wallet.publicKey);
+    const devWallet = walletService.getDevWallet();
+    if (!devWallet) {
+      throw new Error('Dev wallet not initialized');
+    }
     
-    // 2. Send welcome message
+    const balance = await transactionService.getWalletBalance(0);
+    
+    // Send welcome message
     const welcomeMsg = '👋 Welcome to PumpFun Bot!\n\n' +
                       'This bot helps you manage wallets and launch tokens on Pump.fun.\n\n' +
                       '📍 Please select a section from the main menu below:';
@@ -266,8 +272,12 @@ bot.hears(WALLET_MENU_BUTTONS.CREATE_WALLETS, async (ctx) => {
   console.log('Received create wallets button click');
   
   try {
-    const wallet = await initDevWallet();
-    const balance = await transactionService.getDevWalletBalance(wallet.publicKey);
+    const devWallet = walletService.getDevWallet();
+    if (!devWallet) {
+      throw new Error('Dev wallet not initialized');
+    }
+    
+    const balance = await transactionService.getWalletBalance(0);
     
     const keyboard = Markup.inlineKeyboard([
       [
@@ -282,7 +292,7 @@ bot.hears(WALLET_MENU_BUTTONS.CREATE_WALLETS, async (ctx) => {
     if (balance < 0.03) {
       message += '\n\n⚠️ Warning: Dev wallet has insufficient SOL for creating Lookup Tables.\n' +
                  `Current balance: ${balance.toFixed(4)} SOL\n` +
-                 `Dev wallet address: ${wallet.publicKey}\n` +
+                 `Dev wallet address: ${devWallet.publicKey.toString()}\n` +
                  'Please fund this wallet with at least 0.03 SOL before creating Lookup Tables.';
     } else {
       message += `\n\nDev wallet balance: ${balance.toFixed(4)} SOL ✅`;
@@ -299,24 +309,38 @@ bot.hears(WALLET_MENU_BUTTONS.DISTRIBUTE_BUNDLE, async (ctx) => {
   console.log('Received distribute bundle button click');
   
   try {
-    const wallet = await initDevWallet();
-    await transactionService.loadWalletsFromSet();
-    const balance = await transactionService.getWalletBalance(24);
+    const devWallet = walletService.getDevWallet();
+    if (!devWallet) {
+      throw new Error('Dev wallet not initialized');
+    }
+    
+    const balance = await transactionService.getWalletBalance(0);
+    
+    const bundlePayer = walletService.getWalletByIndex(24);
+    if (!bundlePayer) {
+      await ctx.reply('❌ Bundle payer wallet (#24) not found');
+      return;
+    }
+    const bundleBalance = await transactionService.getBundlePayerBalance();
     
     await ctx.reply(
-      'Распределение SOL на bundle кошельки\n\n' +
-      `💰 Баланс кошелька #24: ${balance.toFixed(4)} SOL\n\n` +
-      'Введите сумму SOL для распределения:'
+      '💰 Bundle Distribution\n\n' +
+      'This will distribute SOL from the bundle payer wallet to bundle wallets.\n\n' +
+      'Current status:\n' +
+      `📝 Bundle payer wallet address: ${bundlePayer.publicKey.toString()}\n` +
+      `💰 Balance: ${bundleBalance.toFixed(4)} SOL\n\n` +
+      'Please enter the amount of SOL to distribute to each bundle wallet:'
     );
 
-    userStates.set(ctx.from.id.toString(), {
+    // Set user state
+    const userId = ctx.from?.id.toString() || '';
+    userStates.set(userId, {
       waitingForAmount: true,
-      distributionType: 'bundle',
-      tokenData: createEmptyTokenData()
+      distributionType: 'bundle'
     });
   } catch (error) {
     console.error('Error in distribute_bundle button:', error);
-    ctx.reply('❌ Ошибка при проверке баланса. Пожалуйста, попробуйте позже.');
+    ctx.reply('❌ Error preparing bundle distribution. Please try again later.');
   }
 });
 
@@ -324,26 +348,38 @@ bot.hears(WALLET_MENU_BUTTONS.DISTRIBUTE_MARKET, async (ctx) => {
   console.log('Received distribute market button click');
   
   try {
-    const wallet = await initDevWallet();
-    await transactionService.loadWalletsFromSet();
-    const balance = await transactionService.getWalletBalance(25);
+    const devWallet = walletService.getDevWallet();
+    if (!devWallet) {
+      throw new Error('Dev wallet not initialized');
+    }
     
-    const keyboard = Markup.inlineKeyboard([
-      [
-        Markup.button.callback('С Lookup Table', 'distribute_with_lut'),
-        Markup.button.callback('Без Lookup Table', 'distribute_without_lut')
-      ]
-    ]);
+    const balance = await transactionService.getWalletBalance(0);
+    
+    const marketMakingPayer = walletService.getWalletByIndex(25);
+    if (!marketMakingPayer) {
+      await ctx.reply('❌ Market making payer wallet (#25) not found');
+      return;
+    }
+    const marketMakingBalance = await transactionService.getMarketMakingPayerBalance();
     
     await ctx.reply(
-      'Распределение SOL на market making кошельки\n\n' +
-      `💰 Баланс кошелька #25: ${balance.toFixed(4)} SOL\n\n` +
-      'Выберите способ распределения:',
-      keyboard
+      '📊 Market Making Distribution\n\n' +
+      'This will distribute SOL from the market making payer wallet to market making wallets.\n\n' +
+      'Current status:\n' +
+      `📝 Market making payer wallet address: ${marketMakingPayer.publicKey.toString()}\n` +
+      `💰 Balance: ${marketMakingBalance.toFixed(4)} SOL\n\n` +
+      'Please enter the amount of SOL to distribute to each market making wallet:'
     );
+    
+    // Set user state
+    const userId = ctx.from?.id.toString() || '';
+    userStates.set(userId, {
+      waitingForAmount: true,
+      distributionType: 'marketMakers'
+    });
   } catch (error) {
     console.error('Error in distribute_market button:', error);
-    ctx.reply('❌ Ошибка при проверке баланса. Пожалуйста, попробуйте позже.');
+    ctx.reply('❌ Error preparing market making distribution. Please try again later.');
   }
 });
 
@@ -371,11 +407,15 @@ bot.hears(WALLET_MENU_BUTTONS.DEV_WALLET, async (ctx) => {
   console.log('Received dev wallet button click');
   
   try {
-    const wallet = await initDevWallet();
-    const balance = await transactionService.getDevWalletBalance(wallet.publicKey);
+    const devWallet = walletService.getDevWallet();
+    if (!devWallet) {
+      throw new Error('Dev wallet not initialized');
+    }
+    
+    const balance = await transactionService.getWalletBalance(0);
     
     let message = '🔑 Dev Wallet Information:\n\n' +
-                  `📝 Public Key: ${wallet.publicKey}\n` +
+                  `📝 Public Key: ${devWallet.publicKey.toString()}\n` +
                   `💰 Balance: ${balance.toFixed(4)} SOL\n\n`;
     
     if (balance < 0.03) {
@@ -384,7 +424,7 @@ bot.hears(WALLET_MENU_BUTTONS.DEV_WALLET, async (ctx) => {
                  '💡 You can use:\n' +
                  '- Solana Faucet: https://faucet.solana.com\n' +
                  '- Transfer SOL from another wallet';
-    } else {
+      } else {
       message += '✅ This wallet has sufficient SOL for creating Lookup Tables.';
     }
     
@@ -406,15 +446,61 @@ bot.hears(WALLET_MENU_BUTTONS.WALLET_SETS, async (ctx) => {
       return;
     }
 
+    const activeSetId = walletService.getActiveWalletSetId();
     let message = '📝 Доступные наборы кошельков:\n\n';
+    
     sets.forEach(set => {
       const date = set.createdAt.toLocaleDateString('ru-RU');
-      message += `🔹 Набор ${set.id} (создан ${date})\n`;
+      const isActive = set.id === activeSetId ? ' ✅' : '';
+      message += `🔹 Набор ${set.id} (создан ${date})${isActive}\n`;
     });
 
+    message += '\nДля выбора набора используйте команду /select_wallet_set <ID>';
     ctx.reply(message);
   } catch (error) {
     console.error('Error in wallet_sets button:', error);
+    ctx.reply('❌ Ошибка при получении списка наборов. Пожалуйста, попробуйте позже.');
+  }
+});
+
+bot.hears(WALLET_MENU_BUTTONS.SELECT_SET, async (ctx) => {
+  console.log('Received select wallet set button click');
+  
+  try {
+    const sets = walletSetService.getWalletSets();
+    
+    if (sets.length === 0) {
+      ctx.reply('❌ Нет доступных наборов кошельков. Создайте новый набор с помощью кнопки "Create Wallets"');
+      return;
+    }
+
+    const activeSetId = walletService.getActiveWalletSetId();
+    const buttons = sets.map(set => {
+      const date = set.createdAt.toLocaleDateString('ru-RU');
+      const isActive = set.id === activeSetId ? ' ✅' : '';
+      return [{
+        text: `${set.id} (${date})${isActive}`,
+        callback_data: `select_set_${set.id}`
+      }];
+    });
+
+    await ctx.reply(
+      '🎯 Выберите набор кошельков:\n\n' +
+      'Текущий активный набор отмечен галочкой ✅',
+      {
+        reply_markup: {
+          inline_keyboard: [
+            ...buttons,
+            [{
+              text: '❌ Отмена',
+              callback_data: 'cancel_select_set'
+            }]
+          ]
+        }
+      }
+    );
+  } catch (error) {
+    console.error('Error in select set button:', error);
     ctx.reply('❌ Ошибка при получении списка наборов. Пожалуйста, попробуйте позже.');
   }
 });
@@ -446,7 +532,7 @@ bot.hears(LAUNCH_MENU_BUTTONS.CREATE_TOKEN, async (ctx) => {
     );
     
     console.log('Launch command completed successfully');
-  } catch (error) {
+    } catch (error) {
     console.error('Error in create_token button:', error);
     await ctx.reply('❌ Ошибка при запуске создания токена. Пожалуйста, попробуйте позже.');
   }
@@ -563,11 +649,15 @@ bot.command('dev_wallet', async (ctx) => {
   console.log('Received dev_wallet command from:', ctx.from?.username);
   
   try {
-    const wallet = await initDevWallet();
-    const balance = await transactionService.getDevWalletBalance(wallet.publicKey);
+    const devWallet = walletService.getDevWallet();
+    if (!devWallet) {
+      throw new Error('Dev wallet not initialized');
+    }
+    
+    const balance = await transactionService.getWalletBalance(0);
     
     let message = '🔑 Dev Wallet Information:\n\n' +
-                  `📝 Public Key: ${wallet.publicKey}\n` +
+                  `📝 Public Key: ${devWallet.publicKey.toString()}\n` +
                   `💰 Balance: ${balance.toFixed(4)} SOL\n\n`;
     
     if (balance < 0.03) {
@@ -592,8 +682,12 @@ bot.command('create_wallets', async (ctx) => {
   console.log('Received create_wallets command from:', ctx.from?.username);
   
   try {
-    const wallet = await initDevWallet();
-    const balance = await transactionService.getDevWalletBalance(wallet.publicKey);
+    const devWallet = walletService.getDevWallet();
+    if (!devWallet) {
+      throw new Error('Dev wallet not initialized');
+    }
+    
+    const balance = await transactionService.getWalletBalance(0);
     
     const keyboard = Markup.inlineKeyboard([
       [
@@ -608,7 +702,7 @@ bot.command('create_wallets', async (ctx) => {
     if (balance < 0.03) {
       message += '\n\n⚠️ Warning: Dev wallet has insufficient SOL for creating Lookup Tables.\n' +
                  `Current balance: ${balance.toFixed(4)} SOL\n` +
-                 `Dev wallet address: ${wallet.publicKey}\n` +
+                 `Dev wallet address: ${devWallet.publicKey.toString()}\n` +
                  'Please fund this wallet with at least 0.03 SOL before creating Lookup Tables.';
     } else {
       message += `\n\nDev wallet balance: ${balance.toFixed(4)} SOL ✅`;
@@ -626,15 +720,18 @@ bot.action(/create_(with|without)_lut/, async (ctx) => {
   const createWithLUT = ctx.match[1] === 'with';
   
   try {
-    const wallet = await initDevWallet();
+    const devWallet = walletService.getDevWallet();
+    if (!devWallet) {
+      throw new Error('Dev wallet not initialized');
+    }
     
     if (createWithLUT) {
-      const balance = await transactionService.getDevWalletBalance(wallet.publicKey);
+      const balance = await transactionService.getWalletBalance(0);
       
       if (balance < 0.03) {
         ctx.reply(`⚠️ Warning: Dev wallet has insufficient SOL for creating Lookup Tables.\n` +
                   `Current balance: ${balance.toFixed(4)} SOL\n` +
-                  `Dev wallet address: ${wallet.publicKey}\n\n` +
+                  `Dev wallet address: ${devWallet.publicKey.toString()}\n\n` +
                   `Proceeding with wallet creation, but Lookup Tables will not be created.\n` +
                   `Please fund the dev wallet and try again later.`);
         
@@ -697,7 +794,7 @@ async function handleWalletCreationResult(ctx: any, result: any, requestedLUT: b
     
     if (result.error.includes('has no SOL to pay')) {
       message += '\n\n📝 Для создания Lookup Tables пополните баланс dev кошелька и попробуйте снова.\n' +
-                 `📝 Адрес dev кошелька: ${(await initDevWallet()).publicKey}\n` +
+                 `📝 Адрес dev кошелька: ${walletService.getDevWallet()?.publicKey.toString()}\n` +
                  '📝 Вы можете использовать Solana Faucet или перевести SOL с другого кошелька.';
     }
   }
@@ -727,12 +824,16 @@ bot.command('wallet_sets', async (ctx) => {
       return;
     }
 
+    const activeSetId = walletService.getActiveWalletSetId();
     let message = '📝 Доступные наборы кошельков:\n\n';
+    
     sets.forEach(set => {
       const date = set.createdAt.toLocaleDateString('ru-RU');
-      message += `🔹 Набор ${set.id} (создан ${date})\n`;
+      const isActive = set.id === activeSetId ? ' ✅' : '';
+      message += `🔹 Набор ${set.id} (создан ${date})${isActive}\n`;
     });
 
+    message += '\nДля выбора набора используйте команду /select_wallet_set <ID>';
     ctx.reply(message);
   } catch (error) {
     console.error('Error in wallet_sets command:', error);
@@ -754,7 +855,10 @@ bot.command('distribute_bundle', async (ctx) => {
   console.log('Received distribute_bundle command from:', ctx.from?.username);
   
   try {
-    const wallet = await initDevWallet();
+    const devWallet = walletService.getDevWallet();
+    if (!devWallet) {
+      throw new Error('Dev wallet not initialized');
+    }
     
     // Ensure wallets are loaded from the most recent set
     await transactionService.loadWalletsFromSet();
@@ -783,7 +887,10 @@ bot.command('distribute_market', async (ctx) => {
   console.log('Received distribute_market command from:', ctx.from?.username);
   
   try {
-    const wallet = await initDevWallet();
+    const devWallet = walletService.getDevWallet();
+    if (!devWallet) {
+      throw new Error('Dev wallet not initialized');
+    }
     
     // Ensure wallets are loaded from the most recent set
     await transactionService.loadWalletsFromSet();
@@ -1856,7 +1963,7 @@ bot.action('confirm_launch', async (ctx) => {
           retentionPercent: 0,
           totalSol: 0,
           transactions: [],
-          mintAddress: result.mintAddress
+        mintAddress: result.mintAddress
         }
       });
 
@@ -1929,9 +2036,11 @@ bot.command('help', async (ctx) => {
   helpMessage += '/create_wallets - Создать новые кошельки\n';
   helpMessage += '/distribute_bundle - Распределить SOL на bundle кошельки\n';
   helpMessage += '/distribute_market - Распределить SOL на market making кошельки\n';
-  helpMessage += '/check_balance - Проверить баланс кошелька\n';
+  helpMessage += '/check_balance - Проверить балансы всех кошельков\n';
+  helpMessage += '/wallet_balance <номер> - Проверить баланс конкретного кошелька\n';
   helpMessage += '/dev_wallet - Информация о dev кошельке\n';
-  helpMessage += '/wallet_sets - Список наборов кошельков\n\n';
+  helpMessage += '/wallet_sets - Список наборов кошельков\n';
+  helpMessage += '/select_wallet_set <ID> - Выбрать набор кошельков\n\n';
   
   helpMessage += '🪙 Управление токенами:\n';
   helpMessage += '/launch - Создать новый токен\n';
@@ -1993,7 +2102,7 @@ bot.action('confirm_bundle', async (ctx) => {
           undefined,
           `⏳ Выполнено ${successCount} из ${transactions.length} транзакций...`
         );
-      } catch (error) {
+  } catch (error) {
         console.error(`Error in transaction for wallet #${tx.walletNumber}:`, error);
         failCount++;
       }
@@ -2034,35 +2143,6 @@ bot.action('cancel_bundle', async (ctx) => {
   await ctx.reply('❌ Bundle покупка отменена');
 });
 
-// Launch bot
-bot.launch().then(async () => {
-  console.log('Bot started successfully!');
-  console.log('Bot username:', bot.botInfo?.username);
-  
-  // Initialize dev wallet on startup
-  try {
-    const wallet = await initDevWallet();
-    console.log('Dev wallet initialized:', wallet.publicKey);
-    
-    // Initialize transaction service with dev wallet
-    const balance = await transactionService.getDevWalletBalance(wallet.publicKey);
-    console.log('Dev wallet balance:', balance.toFixed(4), 'SOL');
-
-    // Start accepting commands
-    console.log('Bot ready to accept commands...');
-  } catch (error) {
-    console.error('Failed to initialize dev wallet:', error);
-    throw new Error('Bot initialization failed: Dev wallet could not be initialized');
-  }
-}).catch((error) => {
-  console.error('Error starting bot:', error);
-  process.exit(1); // Exit if initialization fails
-});
-
-// Enable graceful stop
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
-
 // Add middleware to ensure dev wallet is initialized before handling commands
 bot.use(async (ctx, next) => {
   try {
@@ -2070,7 +2150,10 @@ bot.use(async (ctx, next) => {
     const devWallet = walletService.getDevWallet();
     if (!devWallet) {
       console.log('Dev wallet not found in middleware, attempting to initialize...');
-      await initDevWallet();
+      // If no dev wallet is set, create a new one
+      const keypair = Keypair.generate();
+      await walletService.setDevWallet(keypair);
+      console.log('Created new dev wallet:', keypair.publicKey.toString());
     }
     console.log('Dev wallet check completed, proceeding with command...');
     return next();
@@ -2082,4 +2165,197 @@ bot.use(async (ctx, next) => {
     // Still proceed with next middleware even if there's an error
     return next();
   }
+});
+
+// Select wallet set command
+bot.command('select_wallet_set', async (ctx) => {
+  try {
+    const setId = ctx.message.text.split(' ')[1];
+    if (!setId) {
+      ctx.reply('❌ Пожалуйста, укажите ID набора кошельков. Например: /select_wallet_set 14a');
+      return;
+    }
+
+    const set = walletSetService.getWalletSet(setId);
+    if (!set) {
+      ctx.reply(`❌ Набор кошельков с ID "${setId}" не найден. Используйте /wallet_sets для просмотра доступных наборов.`);
+      return;
+    }
+
+    await walletService.setActiveWalletSet(setId);
+    const date = set.createdAt.toLocaleDateString('ru-RU');
+    ctx.reply(`✅ Выбран набор кошельков ${setId} (создан ${date})`);
+  } catch (error) {
+    console.error('Error in select_wallet_set command:', error);
+    ctx.reply('❌ Ошибка при выборе набора кошельков. Пожалуйста, попробуйте позже.');
+  }
+});
+
+// Modify wallet_sets command to show active set
+bot.command('wallet_sets', async (ctx) => {
+  try {
+    const sets = walletSetService.getWalletSets();
+    
+    if (sets.length === 0) {
+      ctx.reply('❌ Нет доступных наборов кошельков. Создайте новый набор с помощью команды /create_wallets');
+      return;
+    }
+
+    const activeSetId = walletService.getActiveWalletSetId();
+    let message = '📝 Доступные наборы кошельков:\n\n';
+    
+    sets.forEach(set => {
+      const date = set.createdAt.toLocaleDateString('ru-RU');
+      const isActive = set.id === activeSetId ? ' ✅' : '';
+      message += `🔹 Набор ${set.id} (создан ${date})${isActive}\n`;
+    });
+
+    message += '\nДля выбора набора используйте команду /select_wallet_set <ID>';
+    ctx.reply(message);
+  } catch (error) {
+    console.error('Error in wallet_sets command:', error);
+    ctx.reply('❌ Ошибка при получении списка наборов. Пожалуйста, попробуйте позже.');
+  }
+});
+
+// Wallet balance command
+bot.command('wallet_balance', async (ctx) => {
+  try {
+    const walletNumber = parseInt(ctx.message.text.split(' ')[1]);
+    
+    if (isNaN(walletNumber) || walletNumber < 0 || walletNumber > 100) {
+      ctx.reply(
+        '❌ Пожалуйста, укажите корректный номер кошелька (0-100).\n\n' +
+        'Например: /wallet_balance 24\n\n' +
+        '0 - dev кошелек\n' +
+        '1-23 - bundle кошельки\n' +
+        '24 - bundle payer кошелек\n' +
+        '25 - market making payer кошелек\n' +
+        '26-100 - market making кошельки'
+      );
+      return;
+    }
+
+    const loadingMsg = await ctx.reply('⏳ Проверяем баланс кошелька...');
+    
+    const activeSetId = walletService.getActiveWalletSetId();
+    const wallet = await walletService.getWallet(walletNumber);
+    
+    if (!wallet) {
+      await ctx.telegram.editMessageText(
+        loadingMsg.chat.id,
+        loadingMsg.message_id,
+        undefined,
+        '❌ Кошелек не найден'
+      );
+      return;
+    }
+
+    const balance = await transactionService.getWalletBalance(walletNumber);
+    let walletType = '';
+    
+    if (walletNumber === 0) walletType = 'Dev кошелек';
+    else if (walletNumber >= 1 && walletNumber <= 23) walletType = 'Bundle кошелек';
+    else if (walletNumber === 24) walletType = 'Bundle payer кошелек';
+    else if (walletNumber === 25) walletType = 'Market making payer кошелек';
+    else walletType = 'Market making кошелек';
+
+    let message = `💰 Информация о кошельке #${walletNumber}\n\n`;
+    message += `📝 Тип: ${walletType}\n`;
+    message += `💳 Адрес: ${wallet.publicKey.toString()}\n`;
+    message += `💰 Баланс: ${balance.toFixed(4)} SOL\n`;
+    
+    if (activeSetId) {
+      message += `📚 Набор кошельков: ${activeSetId}\n`;
+    }
+    
+    message += '\n🔍 Посмотреть на Solscan:\n';
+    message += `https://solscan.io/account/${wallet.publicKey.toString()}`;
+
+    await ctx.telegram.editMessageText(
+      loadingMsg.chat.id,
+      loadingMsg.message_id,
+      undefined,
+      message
+    );
+  } catch (error) {
+    console.error('Error in wallet_balance command:', error);
+    ctx.reply('❌ Ошибка при проверке баланса кошелька. Пожалуйста, попробуйте позже.');
+  }
+});
+
+// Handle wallet menu buttons
+// ... existing code ...
+
+bot.hears(new RegExp(WALLET_MENU_BUTTONS.SELECT_SET.replace('🎯', '.*').trim()), async (ctx) => {
+  console.log('Received select wallet set button click');
+  
+  try {
+    const sets = walletSetService.getWalletSets();
+    
+    if (sets.length === 0) {
+      ctx.reply('❌ Нет доступных наборов кошельков. Создайте новый набор с помощью кнопки "Create Wallets"');
+      return;
+    }
+
+    const activeSetId = walletService.getActiveWalletSetId();
+    const buttons = sets.map(set => {
+      const date = set.createdAt.toLocaleDateString('ru-RU');
+      const isActive = set.id === activeSetId ? ' ✅' : '';
+      return [{
+        text: `${set.id} (${date})${isActive}`,
+        callback_data: `select_set_${set.id}`
+      }];
+    });
+
+    await ctx.reply(
+      '🎯 Выберите набор кошельков:\n\n' +
+      'Текущий активный набор отмечен галочкой ✅',
+      {
+        reply_markup: {
+          inline_keyboard: [
+            ...buttons,
+            [{
+              text: '❌ Отмена',
+              callback_data: 'cancel_select_set'
+            }]
+          ]
+        }
+      }
+    );
+  } catch (error) {
+    console.error('Error in select set button:', error);
+    ctx.reply('❌ Ошибка при получении списка наборов. Пожалуйста, попробуйте позже.');
+  }
+});
+
+// Handle set selection
+bot.action(/^select_set_(.+)$/, async (ctx) => {
+  console.log('Received select set callback');
+  
+  try {
+    const setId = ctx.match[1];
+    const set = walletSetService.getWalletSet(setId);
+    
+    if (!set) {
+      await ctx.reply(`❌ Набор кошельков с ID "${setId}" не найден.`);
+      return;
+    }
+
+    await walletService.setActiveWalletSet(setId);
+    const date = set.createdAt.toLocaleDateString('ru-RU');
+    
+    await ctx.editMessageText(
+      `✅ Выбран набор кошельков ${setId} (создан ${date})\n\n` +
+      'Все операции теперь будут использовать кошельки из этого набора.'
+    );
+  } catch (error) {
+    console.error('Error selecting wallet set:', error);
+    await ctx.reply('❌ Ошибка при выборе набора кошельков. Пожалуйста, попробуйте позже.');
+  }
+});
+
+// Handle selection cancellation
+bot.action('cancel_select_set', async (ctx) => {
+  await ctx.editMessageText('❌ Выбор набора кошельков отменен');
 });
