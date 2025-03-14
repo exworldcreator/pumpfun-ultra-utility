@@ -13,6 +13,7 @@ yarn-error.log
 dev-wallet.json
 wallets.csv
 wallet-sets/
+db/wallet-sets.json
 
 # Build
 dist/
@@ -34,4 +35,4 @@ Thumbs.db
 
 # Database
 *.sql
-*.dump db/wallet-sets.json
+*.dump
