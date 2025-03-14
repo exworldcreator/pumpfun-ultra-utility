@@ -404,7 +404,6 @@ export class PumpFunService {
     payer: Keypair
   ): Promise<string> {
     try {
-      // Use the known working fee recipient
       const feeRecipient = new PublicKey('62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV');
       console.log('Using fee recipient:', feeRecipient.toBase58());
 
@@ -413,6 +412,66 @@ export class PumpFunService {
         [Buffer.from("bonding-curve"), mint.toBuffer()],
         PUMP_FUN_PROGRAM_ID
       );
+
+      // Get bonding curve data to calculate price
+      const bondingCurveInfo = await this.connection.getAccountInfo(bondingCurvePublicKey);
+      if (!bondingCurveInfo) throw new Error('Bonding curve not found');
+
+      // Десериализуем данные bonding curve
+      const bondingCurveData = bondingCurveInfo.data;
+      const virtualTokenReserves = bondingCurveData.readBigUInt64LE(8);  // Skip discriminator
+      const virtualSolReserves = bondingCurveData.readBigUInt64LE(16);   
+
+      // Конвертируем все значения в lamports для точности
+      const tokenDecimals = 6;
+      // Вычитаем комиссию за транзакцию из суммы покупки
+      const txFee = 5000; // 0.000005 SOL
+      const amountInLamports = BigInt(Math.floor(amountInSol * LAMPORTS_PER_SOL)) - BigInt(txFee);
+      
+      // Используем BigInt для точных вычислений
+      const x = virtualSolReserves;
+      const y = virtualTokenReserves;
+      const deltaX = amountInLamports;
+
+      console.log('Initial values:', {
+        virtualTokenReserves: virtualTokenReserves.toString(),
+        virtualSolReserves: virtualSolReserves.toString(),
+        amountInLamports: amountInLamports.toString(),
+        amountInSol,
+        txFee: txFee / LAMPORTS_PER_SOL
+      });
+      
+      // Используем промежуточные значения с плавающей точкой для большей точности
+      const xFloat = Number(x) / LAMPORTS_PER_SOL;
+      const yFloat = Number(y) / Math.pow(10, tokenDecimals);
+      const deltaXFloat = Number(deltaX) / LAMPORTS_PER_SOL;
+      
+      // Рассчитываем ожидаемое количество токенов по формуле bonding curve
+      // Formula: deltaY = y * ((1 + deltaX/x)^0.5 - 1)
+      const ratio = deltaXFloat / xFloat;
+      const sqrtTerm = Math.sqrt(1 + ratio);
+      const multiplier = sqrtTerm - 1;
+      
+      // Конвертируем результат обратно в lamports
+      const expectedTokenAmount = BigInt(Math.floor(yFloat * multiplier * Math.pow(10, tokenDecimals)));
+      
+      // Устанавливаем minTokenAmount как 90% от ожидаемого количества для учета проскальзывания
+      const minTokenAmountLamports = expectedTokenAmount * BigInt(90) / BigInt(100);
+      const maxSolCostLamports = amountInLamports;
+
+      console.log('Calculation details:', {
+        xFloat,
+        yFloat,
+        deltaXFloat,
+        ratio,
+        sqrtTerm,
+        multiplier,
+        expectedTokenAmount: Number(expectedTokenAmount) / Math.pow(10, tokenDecimals),
+        minTokenAmount: Number(minTokenAmountLamports) / Math.pow(10, tokenDecimals),
+        maxSolCost: Number(maxSolCostLamports) / LAMPORTS_PER_SOL,
+        amountInSol,
+        amountInLamports: amountInLamports.toString()
+      });
 
       // Get token accounts
       const associatedUser = await getAssociatedTokenAddress(mint, payer.publicKey);
@@ -439,19 +498,15 @@ export class PumpFunService {
         );
       }
 
-      // Prepare buy instruction data exactly as in the successful transaction
+      // Prepare buy instruction data
       const buyDiscriminator = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
-      const tokenDecimals = 6;
-      const minTokenAmountLamports = BigInt(Math.floor(minTokenAmount * Math.pow(10, tokenDecimals)));
-      const maxSolCostLamports = BigInt(Math.floor(amountInSol * LAMPORTS_PER_SOL));
-
+      
       // Create buffers for the instruction data
       const minTokenAmountBuffer = Buffer.alloc(8);
       minTokenAmountBuffer.writeBigUInt64LE(minTokenAmountLamports);
       const maxSolCostBuffer = Buffer.alloc(8);
       maxSolCostBuffer.writeBigUInt64LE(maxSolCostLamports);
 
-      // Combine the data in the correct order
       const data = Buffer.concat([
         buyDiscriminator,
         minTokenAmountBuffer,
@@ -459,11 +514,13 @@ export class PumpFunService {
       ]);
 
       console.log('Instruction data:', {
-        amount: minTokenAmountLamports.toString(),
-        maxSolCost: maxSolCostLamports.toString()
+        minTokenAmountLamports: minTokenAmountLamports.toString(),
+        maxSolCostLamports: maxSolCostLamports.toString(),
+        minTokenAmountHex: minTokenAmountBuffer.toString('hex'),
+        maxSolCostHex: maxSolCostBuffer.toString('hex')
       });
 
-      // Create buy instruction with exact account structure from the successful transaction
+      // Create buy instruction
       const buyInstruction = new TransactionInstruction({
         programId: PUMP_FUN_PROGRAM_ID,
         keys: [
@@ -500,6 +557,21 @@ export class PumpFunService {
           skipPreflight: false
         }
       );
+
+      // Проверяем результат транзакции
+      const txInfo = await this.connection.getTransaction(signature, {
+        commitment: 'confirmed',
+        maxSupportedTransactionVersion: 0
+      });
+
+      if (txInfo) {
+        console.log('Transaction post-execution info:', {
+          fee: txInfo.meta?.fee,
+          preBalances: txInfo.meta?.preBalances,
+          postBalances: txInfo.meta?.postBalances,
+          logMessages: txInfo.meta?.logMessages
+        });
+      }
 
       console.log(`Token purchase successful! Transaction: ${signature}`);
       return signature;
@@ -583,7 +655,7 @@ export class PumpFunService {
         buySignature = await this.buyTokens(
           new PublicKey(result.mintAddress),
           initialBuyAmount,
-          50, // Минимальное количество токенов, которое хотим получить
+          0, // minTokenAmount больше не используется, так как рассчитывается внутри buyTokens
           wallet
         );
       }
@@ -611,110 +683,184 @@ export class PumpFunService {
     tokenAmount: number,
     payer: Keypair
   ): Promise<string> {
-    try {
-      // Use the known working fee recipient
-      const feeRecipient = new PublicKey('62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV');
-      console.log('Using fee recipient:', feeRecipient.toBase58());
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY = 1000; // 1 second
+    let lastError: Error | null = null;
 
-      // Get bonding curve PDA
-      const [bondingCurvePublicKey] = await PublicKey.findProgramAddress(
-        [Buffer.from("bonding-curve"), mint.toBuffer()],
-        PUMP_FUN_PROGRAM_ID
-      );
-
-      // Get token accounts
-      const associatedUser = await getAssociatedTokenAddress(mint, payer.publicKey);
-      const associatedBondingCurve = await getAssociatedTokenAddress(
-        mint,
-        bondingCurvePublicKey,
-        true
-      );
-
-      // Проверяем состояние bonding curve
-      const bondingCurveInfo = await this.connection.getAccountInfo(bondingCurvePublicKey);
-      if (!bondingCurveInfo) {
-        throw new Error(`Bonding curve for mint ${mint.toBase58()} not found or completed`);
-      }
-
-      // Проверяем баланс токенов на ATA пользователя
-      const userTokenAccountInfo = await this.connection.getTokenAccountBalance(associatedUser);
-      if (!userTokenAccountInfo || !userTokenAccountInfo.value) {
-        throw new Error(`Token account ${associatedUser.toBase58()} not found or empty`);
-      }
-      const tokenBalance = Number(userTokenAccountInfo.value.amount);
-      const tokenDecimals = userTokenAccountInfo.value.decimals;
-      const tokenAmountLamports = BigInt(Math.floor(tokenAmount * Math.pow(10, tokenDecimals)));
-
-      if (tokenBalance < tokenAmountLamports) {
-        throw new Error(
-          `Insufficient token balance on ${associatedUser.toBase58()}. ` +
-          `Required: ${tokenAmount}, Available: ${tokenBalance / Math.pow(10, tokenDecimals)}`
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const feeRecipient = new PublicKey('62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV');
+        console.log(`Attempt ${attempt}/${MAX_RETRIES} to sell tokens...`);
+        
+        // Get bonding curve PDA and token accounts
+        const [bondingCurvePubkey] = await PublicKey.findProgramAddress(
+          [Buffer.from("bonding-curve"), mint.toBuffer()],
+          PUMP_FUN_PROGRAM_ID
         );
-      }
+        
+        const associatedUser = await getAssociatedTokenAddress(mint, payer.publicKey);
+        const associatedBondingCurve = await getAssociatedTokenAddress(
+          mint,
+          bondingCurvePubkey,
+          true
+        );
 
-      // Create transaction
-      const transaction = new Transaction();
-
-      // Prepare sell instruction data
-      const sellDiscriminator = Buffer.from([51, 230, 133, 164, 1, 127, 131, 173]);
-      const amountBuffer = Buffer.alloc(8);
-      amountBuffer.writeBigUInt64LE(tokenAmountLamports);
-
-      const data = Buffer.concat([
-        sellDiscriminator,
-        amountBuffer,
-      ]);
-      console.log('Sell instruction data (hex):', data.toString('hex'));
-      console.log('tokenAmountLamports:', tokenAmountLamports.toString());
-
-      // Create sell instruction
-      const sellInstruction = new TransactionInstruction({
-        programId: PUMP_FUN_PROGRAM_ID,
-        keys: [
-          { pubkey: GLOBAL_PDA, isSigner: false, isWritable: false },              // global
-          { pubkey: feeRecipient, isSigner: false, isWritable: true },            // fee_recipient
-          { pubkey: mint, isSigner: false, isWritable: false },                   // mint
-          { pubkey: bondingCurvePublicKey, isSigner: false, isWritable: true },   // bonding_curve
-          { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },  // associated_bonding_curve
-          { pubkey: associatedUser, isSigner: false, isWritable: true },          // associated_user
-          { pubkey: payer.publicKey, isSigner: true, isWritable: true },          // user
-          { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },// system_program
-          { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },       // token_program
-          { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },     // rent
-          { pubkey: EVENT_AUTHORITY, isSigner: false, isWritable: false },        // event_authority
-          { pubkey: PUMP_FUN_PROGRAM_ID, isSigner: false, isWritable: false },    // program
-        ],
-        data,
-      });
-
-      transaction.add(sellInstruction);
-
-      // Get latest blockhash and send transaction
-      const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
-      transaction.recentBlockhash = blockhash;
-      transaction.feePayer = payer.publicKey;
-
-      console.log('Sending sell transaction...');
-      const signature = await sendAndConfirmTransaction(
-        this.connection,
-        transaction,
-        [payer],
-        { 
-          commitment: 'confirmed',
-          skipPreflight: false,
+        // Verify bonding curve and token balance
+        const bondingCurveInfo = await this.connection.getAccountInfo(bondingCurvePubkey);
+        if (!bondingCurveInfo) {
+          throw new Error(`Bonding curve not found for mint ${mint.toBase58()}`);
         }
-      );
 
-      console.log(`Token sell successful! Transaction: ${signature}`);
-      return signature;
-    } catch (error: unknown) {
-      console.error('Error selling tokens:', error);
-      if (error && typeof error === 'object' && 'logs' in error) {
-        console.error('Transaction logs:', (error as { logs: string[] }).logs);
+        // Проверяем состояние bonding curve
+        const bondingCurveData = bondingCurveInfo.data;
+        const virtualTokenReserves = bondingCurveData.readBigUInt64LE(8);  // Skip discriminator
+        const virtualSolReserves = bondingCurveData.readBigUInt64LE(16);   
+
+        console.log('Bonding curve state:', {
+          virtualTokenReserves: virtualTokenReserves.toString(),
+          virtualSolReserves: virtualSolReserves.toString()
+        });
+
+        // Проверяем баланс токенов
+        const userTokenAccountInfo = await this.connection.getTokenAccountBalance(associatedUser);
+        if (!userTokenAccountInfo?.value?.uiAmount) {
+          throw new Error(`No token balance found for ${associatedUser.toBase58()}`);
+        }
+
+        const tokenDecimals = userTokenAccountInfo.value.decimals;
+        const tokenAmountLamports = BigInt(Math.floor(tokenAmount * Math.pow(10, tokenDecimals)));
+        const userTokenBalance = BigInt(userTokenAccountInfo.value.amount);
+
+        console.log('Token balance info:', {
+          userBalance: userTokenAccountInfo.value.uiAmount,
+          amountToSell: tokenAmount,
+          tokenDecimals,
+          tokenAmountLamports: tokenAmountLamports.toString(),
+          userTokenBalanceLamports: userTokenBalance.toString()
+        });
+
+        if (userTokenBalance < tokenAmountLamports) {
+          throw new Error(`Insufficient token balance. Required: ${tokenAmount}, Available: ${userTokenAccountInfo.value.uiAmount}`);
+        }
+
+        // Create and prepare transaction
+        const transaction = new Transaction();
+        const sellInstruction = new TransactionInstruction({
+          programId: PUMP_FUN_PROGRAM_ID,
+          keys: [
+            { pubkey: GLOBAL_PDA, isSigner: false, isWritable: false },
+            { pubkey: feeRecipient, isSigner: false, isWritable: true },
+            { pubkey: mint, isSigner: false, isWritable: false },
+            { pubkey: bondingCurvePubkey, isSigner: false, isWritable: true },
+            { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },
+            { pubkey: associatedUser, isSigner: false, isWritable: true },
+            { pubkey: payer.publicKey, isSigner: true, isWritable: true },
+            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+            { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+            { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+            { pubkey: EVENT_AUTHORITY, isSigner: false, isWritable: false },
+            { pubkey: PUMP_FUN_PROGRAM_ID, isSigner: false, isWritable: false }
+          ],
+          data: Buffer.concat([
+            Buffer.from([51, 230, 133, 164, 1, 127, 131, 173]), // Правильный дискриминатор для sell
+            (() => { 
+              const buf = Buffer.alloc(8);
+              buf.writeBigUInt64LE(tokenAmountLamports);
+              return buf;
+            })(),
+            (() => { 
+              const buf = Buffer.alloc(8);
+              buf.writeBigUInt64LE(BigInt(0)); // minSolOutput = 0 для максимальной продажи
+              return buf;
+            })()
+          ])
+        });
+
+        transaction.add(sellInstruction);
+
+        // Get fresh blockhash for each attempt
+        const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = payer.publicKey;
+
+        // Simulate transaction first
+        console.log('Simulating transaction...');
+        const simulation = await this.connection.simulateTransaction(transaction, [payer]);
+        
+        if (simulation.value.err) {
+          console.error('Simulation error details:', {
+            error: simulation.value.err,
+            logs: simulation.value.logs
+          });
+          throw new Error(`Transaction simulation failed: ${JSON.stringify(simulation.value.err)}`);
+        }
+
+        // Send and confirm transaction
+        console.log('Sending transaction...');
+        const signature = await sendAndConfirmTransaction(
+          this.connection,
+          transaction,
+          [payer],
+          {
+            commitment: 'confirmed',
+            skipPreflight: false,
+            maxRetries: 3,
+            preflightCommitment: 'confirmed'
+          }
+        );
+
+        // Additional confirmation check
+        const confirmation = await this.connection.confirmTransaction({
+          signature,
+          blockhash,
+          lastValidBlockHeight
+        }, 'confirmed');
+
+        if (confirmation.value.err) {
+          throw new Error(`Transaction confirmation failed: ${confirmation.value.err}`);
+        }
+
+        // Проверяем результат транзакции
+        const txInfo = await this.connection.getTransaction(signature, {
+          commitment: 'confirmed',
+          maxSupportedTransactionVersion: 0
+        });
+
+        if (txInfo) {
+          console.log('Transaction post-execution info:', {
+            fee: txInfo.meta?.fee,
+            preBalances: txInfo.meta?.preBalances,
+            postBalances: txInfo.meta?.postBalances,
+            logMessages: txInfo.meta?.logMessages
+          });
+        }
+
+        console.log(`Token sell successful! Transaction: ${signature}`);
+        return signature;
+
+      } catch (error) {
+        console.error(`Error in attempt ${attempt}:`, error);
+        
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        lastError = error instanceof Error ? error : new Error(errorMessage);
+
+        // Проверяем специфические ошибки Pump.fun
+        if (errorMessage.includes('Custom program error: 0x66')) {
+          throw new Error('Продажа токенов временно заблокирована');
+        }
+
+        if (attempt < MAX_RETRIES) {
+          const retryDelay = RETRY_DELAY * attempt;
+          console.log(`Retrying in ${retryDelay}ms...`);
+          await new Promise(resolve => setTimeout(resolve, retryDelay));
+          continue;
+        }
+        
+        throw new Error(`Failed to sell tokens after ${MAX_RETRIES} attempts: ${errorMessage}`);
       }
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      throw new Error(`Failed to sell tokens: ${errorMessage}`);
     }
+
+    throw new Error('Failed to sell tokens: Unexpected error');
   }
 
   /**
@@ -727,9 +873,56 @@ export class PumpFunService {
     progressCallback?: (text: string) => Promise<void>
   ): Promise<{ walletNumber: number; signature?: string; error?: string }[]> {
     const results: { walletNumber: number; signature?: string; error?: string }[] = [];
+    const DELAY_BETWEEN_REQUESTS = 200; // 200 миллисекунд между запросами
     
     try {
       console.log('Starting sellAllTokens process...');
+      
+      // Сначала проверяем dev кошелек (wallet #0)
+      console.log('Checking dev wallet (wallet #0)...');
+      if (progressCallback) {
+        await progressCallback('Проверка баланса dev кошелька...');
+      }
+
+      try {
+        const devWallet = this.walletService.getDevWallet();
+        if (devWallet) {
+          console.log('Getting token account for dev wallet...');
+          const associatedUser = await getAssociatedTokenAddress(mint, devWallet.publicKey);
+          
+          try {
+            console.log('Checking token balance for dev wallet...');
+            const tokenBalance = await this.connection.getTokenAccountBalance(associatedUser);
+            if (tokenBalance && tokenBalance.value.uiAmount && tokenBalance.value.uiAmount > 0) {
+              console.log(`Found ${tokenBalance.value.uiAmount} tokens in dev wallet`);
+              if (progressCallback) {
+                await progressCallback(`Продажа ${tokenBalance.value.uiAmount} токенов с dev кошелька...`);
+              }
+
+              const signature = await this.sellTokens(
+                mint,
+                tokenBalance.value.uiAmount,
+                devWallet
+              );
+              
+              console.log(`Successfully sold tokens from dev wallet, signature: ${signature}`);
+              results.push({ walletNumber: 0, signature });
+              
+              // Добавляем задержку после продажи
+              await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_REQUESTS));
+            } else {
+              console.log('No tokens found in dev wallet');
+            }
+          } catch (error) {
+            console.log('Token account not found for dev wallet, skipping');
+          }
+        } else {
+          console.log('Dev wallet not found, skipping');
+        }
+      } catch (error) {
+        console.error('Error processing dev wallet:', error);
+        results.push({ walletNumber: 0, error: error instanceof Error ? error.message : 'Unknown error' });
+      }
       
       // Продаем с bundle кошельков (1-23)
       console.log('Processing bundle wallets (1-23)...');
@@ -745,6 +938,9 @@ export class PumpFunService {
             console.log(`Wallet #${i} not found, skipping`);
             continue;
           }
+
+          // Добавляем задержку перед запросом
+          await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_REQUESTS));
 
           console.log(`Getting token account for wallet #${i}...`);
           const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey);
@@ -766,6 +962,9 @@ export class PumpFunService {
               
               console.log(`Successfully sold tokens from wallet #${i}, signature: ${signature}`);
               results.push({ walletNumber: i, signature });
+              
+              // Добавляем задержку после продажи
+              await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_REQUESTS));
             } else {
               console.log(`No tokens found in wallet #${i}`);
             }
@@ -794,6 +993,9 @@ export class PumpFunService {
             continue;
           }
 
+          // Добавляем задержку перед запросом
+          await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_REQUESTS));
+
           console.log(`Getting token account for wallet #${i}...`);
           const associatedUser = await getAssociatedTokenAddress(mint, wallet.publicKey);
           
@@ -814,6 +1016,9 @@ export class PumpFunService {
               
               console.log(`Successfully sold tokens from wallet #${i}, signature: ${signature}`);
               results.push({ walletNumber: i, signature });
+              
+              // Добавляем задержку после продажи
+              await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_REQUESTS));
             } else {
               console.log(`No tokens found in wallet #${i}`);
             }

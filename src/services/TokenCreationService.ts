@@ -20,7 +20,7 @@ import {
 } from '@solana/spl-token';
 import { WalletService } from './WalletService';
 import { TransactionService } from './TransactionService';
-import { PumpFanService } from './PumpFanService';
+import { PumpFunService } from './PumpFunService';
 import * as readline from 'readline';
 import { promisify } from 'util';
 import axios from 'axios';
@@ -44,7 +44,7 @@ export class TokenCreationService {
     private devWallet: Keypair | null = null;
     private walletService: WalletService;
     private transactionService: TransactionService;
-    private pumpFanService: PumpFanService;
+    private pumpFunService: PumpFunService;
     private rl: readline.Interface;
 
     constructor(
@@ -55,7 +55,7 @@ export class TokenCreationService {
         this.connection = new Connection(rpcUrl, 'confirmed');
         this.walletService = walletService;
         this.transactionService = transactionService;
-        this.pumpFanService = new PumpFanService(rpcUrl);
+        this.pumpFunService = new PumpFunService(walletService, rpcUrl);
         this.rl = readline.createInterface({
             input: process.stdin,
             output: process.stdout
@@ -240,33 +240,35 @@ export class TokenCreationService {
                 throw new Error('Dev wallet not found');
             }
 
-            // Create token on PumpFan
-            console.log('\nCreating token on PumpFan...');
-            const tokenAddress = await this.pumpFanService.createToken({
+            // Create token using PumpFunService
+            console.log('\nCreating token...');
+            const result = await this.pumpFunService.createTokenWithSteps({
                 name: params.name,
                 symbol: params.symbol,
                 description: params.description,
-                image: params.picture,
+                image: Buffer.from(params.picture), // Предполагаем, что picture - это base64 или URL изображения
                 twitter: params.twitter || undefined,
                 telegram: params.telegram || undefined,
                 website: params.website || undefined,
-                devWallet: devWallet
-            });
+                walletNumber: 0 // Используем dev wallet
+            }, params.devBuyAmount);
 
-            console.log(`Token created successfully: ${tokenAddress}`);
+            console.log(`Token created successfully! Mint address: ${result.mintAddress}`);
+            console.log(`Transaction: ${result.solscanUrl}`);
 
-            // Execute buys
-            await this.executeBundleBuys(tokenAddress, params);
+            // Execute dev wallet buy if needed
+            if (params.devBuyAmount > 0) {
+                await this.executeDevWalletBuy(result.mintAddress, params.devBuyAmount);
+            }
 
-            // Get PumpFan token URL
-            const tokenUrl = await this.pumpFanService.getTokenUrl(tokenAddress);
-            console.log(`\nToken successfully created and bought! 🎉`);
-            console.log(`View your token here: ${tokenUrl}`);
+            // Execute bundle buys if needed
+            if (params.bundleRetentionPercent > 0) {
+                await this.executeBundleBuys(result.mintAddress, params);
+            }
 
-            return tokenUrl;
-
+            return result.mintAddress;
         } catch (error) {
-            console.error('Error in token creation process:', error);
+            console.error('Error in createAndBuyToken:', error);
             throw error;
         } finally {
             this.rl.close();
@@ -338,111 +340,87 @@ export class TokenCreationService {
     }
 
     private async executeDevWalletBuy(tokenAddress: string, amount: number): Promise<void> {
-        console.log(`\nBuying ${amount} SOL with dev wallet...`);
-        
         const devWallet = this.walletService.getWalletByIndex(0);
         if (!devWallet) {
             throw new Error('Dev wallet not found');
         }
 
-        const signature = await this.pumpFanService.buyToken({
-            tokenAddress,
-            buyerWallet: devWallet,
-            amountInSol: amount
-        });
+        console.log(`Executing dev wallet buy for ${amount} SOL...`);
+        const signature = await this.pumpFunService.buyTokens(
+            new PublicKey(tokenAddress),
+            amount,
+            0, // minTokenAmount будет рассчитан внутри метода
+            devWallet
+        );
 
-        await this.pumpFanService.waitForConfirmation(signature);
+        await this.connection.confirmTransaction(signature, 'confirmed');
         console.log(`Dev wallet buy completed: ${signature}`);
     }
 
     private async executeBundleWalletBuys(tokenAddress: string, retentionPercent: number): Promise<void> {
-        console.log('\nExecuting bundle wallet buys...');
-        const MAX_POOL_SIZE = 85; // Maximum pool size in SOL
-        let totalBought = 0;
-        let failedAttempts = 0;
         const MAX_RETRIES = 3;
+        const MAX_POOL_SIZE = 1000; // Максимальный размер пула в SOL
 
-        // Process first 23 wallets
         for (let i = 1; i <= 23; i++) {
-            const wallet = this.walletService.getWalletByIndex(i);
-            if (!wallet) continue;
-
-            const balance = await this.transactionService.getWalletBalance(i);
-            if (balance <= 0) {
-                console.log(`Skipping wallet #${i} - no balance`);
+            const wallet = await this.walletService.getWallet(i);
+            if (!wallet) {
+                console.log(`Wallet #${i} not found, skipping`);
                 continue;
             }
 
-            // Calculate amount to keep (5% of balance) and amount to buy with
-            const retentionAmount = balance * 0.05; // Fixed 5% retention
-            let buyAmount = balance - retentionAmount;
+            // Получаем баланс кошелька
+            const balance = await this.connection.getBalance(wallet.publicKey);
+            const solBalance = balance / LAMPORTS_PER_SOL;
 
-            // Account for transaction fees to ensure we can actually keep 5%
-            const TX_FEE = 0.000005; // Typical Solana tx fee
-            buyAmount -= TX_FEE;
-
-            // Ensure minimum transaction amount
-            if (buyAmount < 0.000001) {
-                console.log(`Skipping wallet #${i} - amount too small (${buyAmount.toFixed(6)} SOL)`);
+            if (solBalance < 0.002) {
+                console.log(`Wallet #${i} has insufficient balance (${solBalance} SOL), skipping`);
                 continue;
             }
 
-            // Check if we would exceed pool size
-            const currentPoolSize = await this.pumpFanService.getPoolSize(tokenAddress);
-            const remainingSpace = MAX_POOL_SIZE - currentPoolSize;
+            // Рассчитываем сумму для покупки с учетом процента удержания
+            const retentionAmount = (solBalance * retentionPercent) / 100;
+            const reserveForFee = 0.001; // Минимальная сумма для комиссии
+            const amountToKeep = Math.max(retentionAmount, reserveForFee);
+            const buyAmount = solBalance - amountToKeep;
 
-            if (buyAmount > remainingSpace) {
-                if (remainingSpace <= 0) {
-                    console.log('Pool is full, stopping buys');
-                    break;
-                }
-                buyAmount = remainingSpace;
+            console.log(`Bundle wallet #${i} balance calculation:`, {
+                currentBalance: solBalance,
+                retentionPercent,
+                retentionAmount,
+                reserveForFee,
+                amountToKeep,
+                amountToSpend: buyAmount,
+                willBeLeft: amountToKeep
+            });
+
+            if (buyAmount <= 0) {
+                console.log(`Wallet #${i} has insufficient balance after retention (${solBalance} SOL), skipping`);
+                continue;
             }
 
-            console.log(`Wallet #${i} balance: ${balance.toFixed(6)} SOL`);
-            console.log(`Keeping: ${retentionAmount.toFixed(6)} SOL (5%)`);
-            console.log(`Buying: ${buyAmount.toFixed(6)} SOL`);
-            
             let attempt = 0;
             while (attempt < MAX_RETRIES) {
                 try {
-                    const signature = await this.pumpFanService.buyToken({
-                        tokenAddress,
-                        buyerWallet: wallet,
-                        amountInSol: buyAmount
-                    });
+                    const signature = await this.pumpFunService.buyTokens(
+                        new PublicKey(tokenAddress),
+                        buyAmount,
+                        0, // minTokenAmount будет рассчитан внутри метода
+                        wallet
+                    );
 
-                    await this.pumpFanService.waitForConfirmation(signature);
+                    await this.connection.confirmTransaction(signature, 'confirmed');
                     console.log(`Buy completed for wallet #${i}: ${signature}`);
-
-                    totalBought += buyAmount;
-                    failedAttempts = 0; // Reset failed attempts counter on success
-                    
-                    // Add delay between transactions
-                    await new Promise(resolve => setTimeout(resolve, 2000));
-                    break; // Exit retry loop on success
+                    break;
                 } catch (error) {
                     attempt++;
-                    failedAttempts++;
-                    console.error(`Error buying with wallet #${i} (attempt ${attempt}/${MAX_RETRIES}):`, error);
-                    
-                    if (attempt < MAX_RETRIES) {
-                        // Increase delay with each retry
-                        const delay = 2000 * (attempt + 1);
-                        console.log(`Retrying in ${delay/1000} seconds...`);
-                        await new Promise(resolve => setTimeout(resolve, delay));
-                    }
-
-                    // If we've had too many consecutive failures, take a longer break
-                    if (failedAttempts >= 3) {
-                        console.log('Too many consecutive failures, taking a longer break...');
-                        await new Promise(resolve => setTimeout(resolve, 10000));
-                        failedAttempts = 0;
+                    if (attempt === MAX_RETRIES) {
+                        console.error(`Failed to buy tokens for wallet #${i} after ${MAX_RETRIES} attempts:`, error);
+                    } else {
+                        console.log(`Attempt ${attempt} failed for wallet #${i}, retrying...`);
+                        await new Promise(resolve => setTimeout(resolve, 1000));
                     }
                 }
             }
         }
-
-        console.log(`\nTotal bought: ${totalBought.toFixed(4)} SOL`);
     }
 } 

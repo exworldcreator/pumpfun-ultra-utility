@@ -3,6 +3,7 @@ import * as path from 'path';
 import { DatabaseService } from '../../services/DatabaseService';
 import { Keypair } from '@solana/web3.js';
 import dotenv from 'dotenv';
+import { randomBytes } from 'crypto';
 
 dotenv.config();
 
@@ -24,6 +25,15 @@ interface WalletSetData {
   }[];
 }
 
+// Функция для генерации уникального ID набора
+function generateSetId(): string {
+  // Генерируем случайные 4 байта и преобразуем их в hex
+  const randomId = randomBytes(2).toString('hex');
+  // Добавляем временную метку для уникальности
+  const timestamp = Date.now().toString(36);
+  return `${timestamp}-${randomId}`;
+}
+
 async function migrateWalletsToDatabase() {
   try {
     console.log('Starting wallet migration to PostgreSQL...');
@@ -31,77 +41,25 @@ async function migrateWalletsToDatabase() {
     // Получаем экземпляр DatabaseService
     const dbService = DatabaseService.getInstance();
     
-    // Проверяем, существует ли таблица wallets
-    const tableExists = await dbService.query(`
-      SELECT EXISTS (
-        SELECT FROM information_schema.tables 
-        WHERE table_schema = 'public' 
-        AND table_name = 'wallets'
-      );
-    `);
+    // Удаляем существующие таблицы
+    console.log('Dropping existing tables...');
+    await dbService.query('DROP TABLE IF EXISTS wallets CASCADE');
+    await dbService.query('DROP TABLE IF EXISTS tokens CASCADE');
     
-    // Если таблица не существует, создаем ее
-    if (!tableExists.rows[0].exists) {
-      console.log('Creating wallets table...');
-      const sqlFilePath = path.join(__dirname, '001_create_wallets_table.sql');
-      const sqlScript = fs.readFileSync(sqlFilePath, 'utf8');
-      await dbService.query(sqlScript);
-      console.log('Wallets table created successfully.');
-    }
+    // Создаем таблицы заново
+    console.log('Creating tables...');
+    const sqlFilePath = path.join(__dirname, '001_create_wallets_table.sql');
+    const sqlScript = fs.readFileSync(sqlFilePath, 'utf8');
+    await dbService.query(sqlScript);
+    console.log('Tables created successfully.');
     
-    // Проверяем, есть ли уже данные в таблице
-    const walletsCount = await dbService.query('SELECT COUNT(*) FROM wallets');
-    if (parseInt(walletsCount.rows[0].count) > 0) {
-      console.log(`Found ${walletsCount.rows[0].count} wallets in the database. Skipping migration.`);
-      return;
-    }
-    
-    // Пытаемся загрузить данные из wallet-sets.json
-    let wallets: { [key: number]: { publicKey: string, privateKey: string, type: string } } = {};
-    
+    // Загружаем все наборы кошельков из wallet-sets.json
     const walletSetsPath = path.join(__dirname, '../../../db/wallet-sets.json');
-    if (fs.existsSync(walletSetsPath)) {
-      console.log('Loading wallets from wallet-sets.json...');
-      const data = fs.readFileSync(walletSetsPath, 'utf8');
-      const sets = JSON.parse(data) as Record<string, WalletSetData>;
-      
-      // Получаем самый последний набор кошельков
-      const mostRecentSet = Object.values(sets)
-        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())[0];
-      
-      if (mostRecentSet && mostRecentSet.wallets) {
-        mostRecentSet.wallets.forEach(walletData => {
-          const index = parseInt(walletData.NUMBER, 10);
-          wallets[index] = {
-            publicKey: walletData.PUBLIC_KEY,
-            privateKey: walletData.PRIVATE_KEY,
-            type: walletData.TYPE
-          };
-        });
-        console.log(`Loaded ${Object.keys(wallets).length} wallets from wallet-sets.json`);
-      }
-    } else {
-      // Если wallet-sets.json не существует, пытаемся загрузить из wallets.json
-      const walletsPath = path.join(__dirname, '../../../wallets.json');
-      if (fs.existsSync(walletsPath)) {
-        console.log('Loading wallets from wallets.json...');
-        const data = fs.readFileSync(walletsPath, 'utf8');
-        const walletsData: WalletData[] = JSON.parse(data);
-        
-        walletsData.forEach(walletData => {
-          wallets[walletData.index] = {
-            publicKey: walletData.publicKey,
-            privateKey: walletData.privateKey,
-            type: walletData.type
-          };
-        });
-        console.log(`Loaded ${Object.keys(wallets).length} wallets from wallets.json`);
-      }
-    }
-    
-    // Если нет данных для миграции, генерируем новые кошельки
-    if (Object.keys(wallets).length === 0) {
-      console.log('No existing wallets found. Generating new wallets...');
+    if (!fs.existsSync(walletSetsPath)) {
+      console.log('No wallet sets found, generating new set...');
+      // Генерируем новый набор кошельков
+      const newSetId = generateSetId();
+      const wallets: { [key: number]: { publicKey: string, privateKey: string, type: string } } = {};
       
       // Генерируем dev wallet (0)
       const devWallet = Keypair.generate();
@@ -147,38 +105,103 @@ async function migrateWalletsToDatabase() {
         };
       }
       
-      console.log(`Generated ${Object.keys(wallets).length} new wallets`);
-    }
-    
-    // Вставляем данные в базу данных
-    console.log('Inserting wallets into the database...');
-    
-    // Используем транзакцию для атомарной вставки
-    const client = await dbService.getClient();
-    try {
-      await client.query('BEGIN');
+      // Сохраняем новый набор в wallet-sets.json
+      const walletSet = {
+        id: newSetId,
+        createdAt: new Date().toISOString(),
+        wallets: Object.entries(wallets).map(([number, data]) => ({
+          NUMBER: number,
+          TYPE: data.type,
+          PUBLIC_KEY: data.publicKey,
+          PRIVATE_KEY: data.privateKey
+        }))
+      };
       
-      for (const [index, wallet] of Object.entries(wallets)) {
-        await client.query(
-          `INSERT INTO wallets (wallet_number, public_key, private_key, wallet_type) 
-           VALUES ($1, $2, $3, $4)`,
-          [parseInt(index), wallet.publicKey, wallet.privateKey, wallet.type]
-        );
+      const setsDir = path.join(__dirname, '../../../db');
+      if (!fs.existsSync(setsDir)) {
+        fs.mkdirSync(setsDir, { recursive: true });
       }
       
-      await client.query('COMMIT');
-      console.log(`Successfully migrated ${Object.keys(wallets).length} wallets to the database.`);
-    } catch (error) {
-      await client.query('ROLLBACK');
-      console.error('Error during database transaction:', error);
-      throw error;
-    } finally {
-      client.release();
+      fs.writeFileSync(walletSetsPath, JSON.stringify({ [newSetId]: walletSet }, null, 2));
+      console.log(`Created new wallet set with ID: ${newSetId}`);
+      
+      // Вставляем новый набор в базу данных
+      await insertWalletSet(dbService, newSetId, wallets);
+    } else {
+      // Загружаем существующие наборы
+      console.log('Loading existing wallet sets...');
+      const data = fs.readFileSync(walletSetsPath, 'utf8');
+      const sets = JSON.parse(data) as Record<string, WalletSetData>;
+      
+      // Обрабатываем каждый набор
+      for (const [setId, set] of Object.entries(sets)) {
+        console.log(`Processing set ${setId}...`);
+        
+        // Проверяем, существует ли набор в базе
+        const client = await dbService.getClient();
+        try {
+          const existingSet = await client.query(
+            'SELECT COUNT(*) FROM wallets WHERE set_id = $1',
+            [setId]
+          );
+          
+          if (parseInt(existingSet.rows[0].count) > 0) {
+            console.log(`Set ${setId} already exists in database, skipping.`);
+            continue;
+          }
+          
+          // Преобразуем данные в нужный формат
+          const wallets: { [key: number]: { publicKey: string, privateKey: string, type: string } } = {};
+          set.wallets.forEach(wallet => {
+            wallets[parseInt(wallet.NUMBER)] = {
+              publicKey: wallet.PUBLIC_KEY,
+              privateKey: wallet.PRIVATE_KEY,
+              type: wallet.TYPE
+            };
+          });
+          
+          // Вставляем набор в базу данных
+          await insertWalletSet(dbService, setId, wallets);
+        } finally {
+          client.release();
+        }
+      }
     }
     
+    console.log('Migration completed successfully.');
   } catch (error) {
     console.error('Migration failed:', error);
     process.exit(1);
+  }
+}
+
+// Вспомогательная функция для вставки набора кошельков
+async function insertWalletSet(
+  dbService: DatabaseService,
+  setId: string,
+  wallets: { [key: number]: { publicKey: string, privateKey: string, type: string } }
+) {
+  const client = await dbService.getClient();
+  try {
+    await client.query('BEGIN');
+    
+    for (const [index, wallet] of Object.entries(wallets)) {
+      await client.query(
+        `INSERT INTO wallets (wallet_number, public_key, private_key, wallet_type, set_id) 
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (public_key, set_id) DO NOTHING`,
+        [parseInt(index), wallet.publicKey, wallet.privateKey, wallet.type, setId]
+      );
+    }
+    
+    await client.query('COMMIT');
+    console.log(`Successfully migrated set ${setId} to the database.`);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error(`Error during set ${setId} migration:`, error);
+    throw error;
+  } finally {
+    client.release();
   }
 }
 

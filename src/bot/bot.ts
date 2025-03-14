@@ -80,8 +80,8 @@ interface BundleTransaction {
 
 interface BundleData {
   retentionPercent: number;
-  totalSol: number;
-  transactions: BundleTransaction[];
+  totalSol?: number;
+  transactions?: BundleTransaction[];
   mintAddress?: string;
 }
 
@@ -1061,91 +1061,27 @@ bot.on('text', async (ctx) => {
               ...userState.bundleData!,
               mintAddress
             };
-            userState.step = 'retention';
 
-            await ctx.reply(
-              'Введите процент баланса, который нужно оставить на каждом кошельке (например, 5):'
-            );
+            // Формируем сообщение с предварительной информацией
+            let message = '📝 Проверьте данные для bundle покупки:\n\n';
+            message += `🔹 Токен: ${mintAddress}\n`;
+            message += 'Будут использованы кошельки 0-23 с балансом > 0\n';
+            message += 'Каждому кошельку будет оставлено 0.001 SOL на комиссию';
+
+            await ctx.reply(message, {
+              reply_markup: {
+                inline_keyboard: [
+                  [
+                    { text: '✅ Подтвердить', callback_data: 'confirm_bundle' },
+                    { text: '❌ Отменить', callback_data: 'cancel_bundle' }
+                  ]
+                ]
+              }
+            });
+
+            userState.step = '';
           } catch (error) {
             await ctx.reply('❌ Некорректный адрес токена. Пожалуйста, проверьте адрес и попробуйте снова.');
-          }
-          break;
-
-        case 'retention':
-          const percent = parseFloat(ctx.message.text);
-          if (isNaN(percent) || percent < 0 || percent > 100) {
-            await ctx.reply('❌ Пожалуйста, введите корректный процент от 0 до 100');
-            return;
-          }
-
-          try {
-            // Calculate purchases for all bundle wallets
-            const transactions: BundleTransaction[] = [];
-            let totalSol = 0;
-            const maxPoolSize = 85; // Maximum pool size in SOL
-
-            // First, calculate dev wallet purchase (wallet 0)
-            const devWallet = await walletService.getWallet(0);
-            if (devWallet) {
-              const devBalance = await transactionService.getWalletBalance(0);
-              const devAmount = devBalance * (1 - percent / 100);
-              if (devAmount > 0) {
-                transactions.push({ walletNumber: 0, amount: devAmount });
-                totalSol += devAmount;
-              }
-            }
-
-            // Then calculate bundle wallets (1-23)
-            for (let i = 1; i <= 23; i++) {
-              if (totalSol >= maxPoolSize) break;
-
-              const wallet = await walletService.getWallet(i);
-              if (wallet) {
-                const balance = await transactionService.getWalletBalance(i);
-                const amount = balance * (1 - percent / 100);
-                if (amount > 0) {
-                  const remainingSpace = maxPoolSize - totalSol;
-                  const actualAmount = Math.min(amount, remainingSpace);
-                  transactions.push({ walletNumber: i, amount: actualAmount });
-                  totalSol += actualAmount;
-                  if (totalSol >= maxPoolSize) break;
-                }
-              }
-            }
-
-            userState.bundleData = {
-              ...userState.bundleData!,
-              retentionPercent: percent,
-              totalSol,
-              transactions
-            };
-
-            // Show summary and confirmation
-            let summary = '📝 Проверьте данные для bundle покупки:\n\n';
-            summary += `🔹 Токен: ${userState.bundleData.mintAddress}\n`;
-            summary += `🔹 Процент остатка: ${percent}%\n`;
-            summary += `🔹 Всего SOL: ${totalSol.toFixed(4)}\n\n`;
-            summary += 'Транзакции:\n';
-            transactions.forEach(tx => {
-              summary += `Кошелек #${tx.walletNumber}: ${tx.amount.toFixed(4)} SOL\n`;
-            });
-            
-            await ctx.reply(
-              summary,
-              {
-                reply_markup: {
-                  inline_keyboard: [
-                    [
-                      { text: '✅ Подтвердить', callback_data: 'confirm_bundle' },
-                      { text: '❌ Отменить', callback_data: 'cancel_bundle' }
-                    ]
-                  ]
-                }
-              }
-            );
-          } catch (error) {
-            console.error('Error calculating bundle purchases:', error);
-            await ctx.reply('❌ Ошибка при расчете bundle покупок. Пожалуйста, попробуйте позже.');
           }
           break;
       }
@@ -1946,24 +1882,33 @@ bot.action('confirm_launch', async (ctx) => {
       }
       
       resultMessage += '\nТокен создан с использованием технологии Pump.fun.\n\n';
-      resultMessage += 'Введите процент баланса, который нужно оставить на каждом кошельке (например, 5):';
+      resultMessage += 'Сейчас начнется bundle покупка. Нажмите "Подтвердить" для начала:';
 
       await ctx.telegram.editMessageText(
         message.chat.id,
         message.message_id,
         undefined,
-        resultMessage
+        resultMessage,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: '✅ Подтвердить', callback_data: 'confirm_bundle' },
+                { text: '❌ Отменить', callback_data: 'cancel_bundle' }
+              ]
+            ]
+          }
+        }
       );
 
       // Update user state for bundle buying
       userStates.set(userId, {
         distributionType: 'bundleBuy',
-        step: 'retention',
         bundleData: {
           retentionPercent: 0,
           totalSol: 0,
           transactions: [],
-        mintAddress: result.mintAddress
+          mintAddress: result.mintAddress
         }
       });
 
@@ -2067,8 +2012,8 @@ bot.action('confirm_bundle', async (ctx) => {
     return;
   }
 
-  const { mintAddress, transactions } = userState.bundleData;
-  if (!mintAddress || !transactions.length) {
+  const { mintAddress } = userState.bundleData;
+  if (!mintAddress) {
     await ctx.reply('❌ Ошибка: неполные данные для bundle покупки');
     return;
   }
@@ -2076,34 +2021,59 @@ bot.action('confirm_bundle', async (ctx) => {
   const loadingMsg = await ctx.reply('⏳ Выполняем bundle покупки...');
   let successCount = 0;
   let failCount = 0;
+  let totalBoughtSol = 0;
 
   try {
-    for (const tx of transactions) {
+    // Используем только кошельки 0-23 для bundle
+    const walletNumbers = Array.from({ length: 24 }, (_, i) => i);
+    
+    for (const walletNumber of walletNumbers) {
       try {
-        const wallet = await walletService.getWallet(tx.walletNumber);
+        const wallet = await walletService.getWallet(walletNumber);
         if (!wallet) {
-          throw new Error(`Кошелек #${tx.walletNumber} не найден`);
+          console.log(`Кошелек #${walletNumber} не найден, пропускаем`);
+          continue;
         }
 
-        const signature = await pumpFunService.buyTokens(
-          new PublicKey(mintAddress),
-          tx.amount,
-          1, // минимальное количество токенов
-          wallet
-        );
+        // Получаем актуальный баланс кошелька
+        const currentBalance = await transactionService.getWalletBalance(walletNumber);
+        
+        // Оставляем только 0.001 SOL на комиссию
+        const reserveForFee = 0.001;
+        const amountToSpend = Math.max(0, currentBalance - reserveForFee);
 
-        tx.signature = signature;
-        successCount++;
+        console.log(`Bundle wallet #${walletNumber} balance calculation:`, {
+          currentBalance,
+          reserveForFee,
+          amountToSpend,
+          willBeLeft: currentBalance - amountToSpend
+        });
 
-        // Update progress
-        await ctx.telegram.editMessageText(
-          loadingMsg.chat.id,
-          loadingMsg.message_id,
-          undefined,
-          `⏳ Выполнено ${successCount} из ${transactions.length} транзакций...`
-        );
-  } catch (error) {
-        console.error(`Error in transaction for wallet #${tx.walletNumber}:`, error);
+        if (amountToSpend > 0) {
+          const signature = await pumpFunService.buyTokens(
+            new PublicKey(mintAddress),
+            amountToSpend,
+            0, // minTokenAmount рассчитывается внутри buyTokens
+            wallet
+          );
+
+          successCount++;
+          totalBoughtSol += amountToSpend;
+
+          // Update progress
+          await ctx.telegram.editMessageText(
+            loadingMsg.chat.id,
+            loadingMsg.message_id,
+            undefined,
+            `⏳ Выполнено ${successCount} транзакций...\n` +
+            `💰 Всего потрачено: ${totalBoughtSol.toFixed(4)} SOL`
+          );
+
+          // Добавляем небольшую задержку между транзакциями
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      } catch (error) {
+        console.error(`Error in transaction for wallet #${walletNumber}:`, error);
         failCount++;
       }
     }
@@ -2111,14 +2081,9 @@ bot.action('confirm_bundle', async (ctx) => {
     // Final summary
     let summary = '📊 Результаты bundle покупки:\n\n';
     summary += `✅ Успешно: ${successCount}\n`;
-    summary += `❌ Неудачно: ${failCount}\n\n`;
-    summary += `🔗 Токен: https://pump.fun/token/${mintAddress}\n\n`;
-    summary += 'Транзакции:\n';
-    transactions.forEach(tx => {
-      if (tx.signature) {
-        summary += `Кошелек #${tx.walletNumber}: https://solscan.io/tx/${tx.signature}\n`;
-      }
-    });
+    summary += `❌ Неудачно: ${failCount}\n`;
+    summary += `💰 Всего потрачено: ${totalBoughtSol.toFixed(4)} SOL\n\n`;
+    summary += `🔗 Токен: https://pump.fun/token/${mintAddress}`;
 
     await ctx.telegram.editMessageText(
       loadingMsg.chat.id,
@@ -2358,4 +2323,98 @@ bot.action(/^select_set_(.+)$/, async (ctx) => {
 // Handle selection cancellation
 bot.action('cancel_select_set', async (ctx) => {
   await ctx.editMessageText('❌ Выбор набора кошельков отменен');
+});
+
+// Handle market making confirmation
+bot.action('confirm_market', async (ctx) => {
+  const userId = ctx.from?.id.toString();
+  if (!userId) {
+    await ctx.reply('❌ Ошибка: не удалось определить пользователя');
+    return;
+  }
+
+  const userState = userStates.get(userId);
+  if (!userState?.mintAddress) {
+    await ctx.reply('❌ Ошибка: адрес токена не найден');
+    return;
+  }
+
+  const loadingMsg = await ctx.reply('⏳ Выполняем market making покупки...');
+  let successCount = 0;
+  let failCount = 0;
+  let totalBoughtSol = 0;
+
+  try {
+    // Market making wallets: 26-100
+    for (let i = 26; i <= 100; i++) {
+      try {
+        const wallet = await walletService.getWallet(i);
+        if (!wallet) {
+          console.log(`Wallet #${i} not found, skipping`);
+          continue;
+        }
+
+        // Получаем актуальный баланс кошелька
+        const currentBalance = await transactionService.getWalletBalance(i);
+        
+        // Максимально простой расчет: оставляем только 0.001 SOL на комиссию
+        const reserveForFee = 0.001;
+        const amountToSpend = Math.max(0, currentBalance - reserveForFee);
+
+        console.log(`Market making wallet #${i} balance calculation:`, {
+          currentBalance,
+          reserveForFee,
+          amountToSpend,
+          willBeLeft: currentBalance - amountToSpend
+        });
+
+        if (amountToSpend > 0) {
+          const signature = await pumpFunService.buyTokens(
+            new PublicKey(userState.mintAddress),
+            amountToSpend,
+            0, // minTokenAmount рассчитывается внутри buyTokens
+            wallet
+          );
+
+          successCount++;
+          totalBoughtSol += amountToSpend;
+
+          // Update progress
+          await ctx.telegram.editMessageText(
+            loadingMsg.chat.id,
+            loadingMsg.message_id,
+            undefined,
+            `⏳ Выполнено ${successCount} транзакций...\n` +
+            `💰 Всего потрачено: ${totalBoughtSol.toFixed(4)} SOL`
+          );
+
+          // Добавляем небольшую задержку между транзакциями
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      } catch (error) {
+        console.error(`Error in transaction for wallet #${i}:`, error);
+        failCount++;
+      }
+    }
+
+    // Final summary
+    let summary = '📊 Результаты market making покупок:\n\n';
+    summary += `✅ Успешно: ${successCount}\n`;
+    summary += `❌ Неудачно: ${failCount}\n`;
+    summary += `💰 Всего потрачено: ${totalBoughtSol.toFixed(4)} SOL\n\n`;
+    summary += `🔗 Токен: https://pump.fun/token/${userState.mintAddress}`;
+
+    await ctx.telegram.editMessageText(
+      loadingMsg.chat.id,
+      loadingMsg.message_id,
+      undefined,
+      summary
+    );
+
+    // Clear user state
+    userStates.delete(userId);
+  } catch (error) {
+    console.error('Error in market making execution:', error);
+    await ctx.reply('❌ Ошибка при выполнении market making покупок');
+  }
 });
