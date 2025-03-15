@@ -165,11 +165,35 @@ export class PumpFunService {
    */
   private async uploadToPinata(buffer: Buffer, name: string): Promise<string> {
     try {
+      console.log(`Uploading to Pinata: ${name}, size: ${buffer.length / 1024} KB`);
+      
       const stream = Readable.from(buffer);
       const result = await pinata.pinFileToIPFS(stream, {
         pinataMetadata: { name },
+        pinataOptions: {
+          cidVersion: 0 // Используем CIDv0 для совместимости
+        }
       });
-      return `https://ipfs.io/ipfs/${result.IpfsHash}`;
+      
+      // Используем gateway.pinata.cloud вместо ipfs.io для более быстрого доступа
+      const ipfsUri = `https://gateway.pinata.cloud/ipfs/${result.IpfsHash}`;
+      console.log(`Successfully uploaded to IPFS: ${ipfsUri}`);
+      
+      // Проверяем доступность загруженного файла
+      try {
+        const response = await fetch(ipfsUri);
+        if (!response.ok) {
+          console.warn(`Warning: Uploaded file is not accessible via ${ipfsUri}`);
+          // Возвращаем альтернативный URI через ipfs.io
+          return `https://ipfs.io/ipfs/${result.IpfsHash}`;
+        }
+      } catch (error) {
+        console.warn(`Warning: Failed to verify uploaded file: ${error}`);
+        // Возвращаем альтернативный URI через ipfs.io
+        return `https://ipfs.io/ipfs/${result.IpfsHash}`;
+      }
+      
+      return ipfsUri;
     } catch (error) {
       console.error('Error uploading to Pinata:', error);
       throw error;
@@ -247,10 +271,29 @@ export class PumpFunService {
       description: description.trim(),
       image: undefined as string | undefined,
       seller_fee_basis_points: 0, // Добавляем поле для метаданных
+      external_url: website?.trim() || "",
+      attributes: [
+        {
+          trait_type: "Twitter",
+          value: twitter?.trim() || ""
+        },
+        {
+          trait_type: "Telegram",
+          value: telegram?.trim() || ""
+        },
+        {
+          trait_type: "Website",
+          value: website?.trim() || ""
+        }
+      ],
       properties: {
-        twitter: twitter?.trim(),
-        telegram: telegram?.trim(),
-        website: website?.trim(),
+        files: [
+          {
+            uri: undefined as string | undefined,
+            type: "image/png"
+          }
+        ],
+        category: "image",
         creators: [
           {
             address: payer.publicKey.toBase58(),
@@ -264,8 +307,11 @@ export class PumpFunService {
     try {
       // Загружаем изображение, если оно есть
       if (image) {
-        const imageUri = await this.uploadToPinata(image, `${symbol.trim()}_image.jpg`);
+        const imageUri = await this.uploadToPinata(image, `${symbol.trim()}_image.png`);
         metadata.image = imageUri;
+        if (metadata.properties.files && metadata.properties.files[0]) {
+          metadata.properties.files[0].uri = imageUri;
+        }
         console.log('Image uploaded to Pinata:', imageUri);
       } else {
         throw new Error('Image is required for token creation');

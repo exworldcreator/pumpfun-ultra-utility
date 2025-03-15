@@ -2045,35 +2045,32 @@ async function downloadImage(filePath: string): Promise<Buffer> {
 // Helper function to resize and optimize image for IPFS
 async function processImage(imageBuffer: Buffer): Promise<Buffer> {
   try {
-    // Оптимизируем изображение для IPFS
-    // - Уменьшаем размер до 256x256
-    // - Конвертируем в PNG с высоким сжатием
-    // - Ограничиваем размер файла
+    // Оптимизируем изображение для IPFS и Pump.fun
+    // - Уменьшаем размер до 400x400 (более высокое разрешение для лучшего качества)
+    // - Конвертируем в PNG с оптимальным сжатием
+    // - Сохраняем прозрачность если она есть
     const processedImage = await sharp(imageBuffer)
-      .resize(256, 256, {
+      .resize(400, 400, {
         fit: 'contain',
-        background: { r: 255, g: 255, b: 255, alpha: 1 }
+        background: { r: 255, g: 255, b: 255, alpha: 0 } // Прозрачный фон
       })
       .png({
         compressionLevel: 9,
-        quality: 80,
-        palette: true // Используем палитру для уменьшения размера
+        quality: 90
       })
       .toBuffer();
 
     const sizeKB = processedImage.length / 1024;
     console.log(`Processed image size: ${sizeKB.toFixed(2)} KB`);
     
-    // Если изображение все еще слишком большое, уменьшаем его еще сильнее
-    if (sizeKB > 100) {
-      console.log('Image is too large, reducing quality further');
+    // Если изображение все еще слишком большое, уменьшаем его, но сохраняем качество
+    if (sizeKB > 200) {
+      console.log('Image is too large, reducing size further');
       return await sharp(processedImage)
-        .resize(128, 128)
+        .resize(300, 300)
         .png({
           compressionLevel: 9,
-          quality: 60,
-          palette: true,
-          colors: 64 // Ограничиваем количество цветов
+          quality: 85
         })
         .toBuffer();
     }
@@ -2165,23 +2162,13 @@ bot.action('confirm_launch', async (ctx) => {
       }
       
       resultMessage += '\nТокен создан с использованием технологии Pump.fun.\n\n';
-      resultMessage += 'Сейчас начнется bundle покупка. Нажмите "Подтвердить" для начала:';
+      resultMessage += '🔄 Ожидаем подтверждения транзакции в блокчейне перед началом bundle покупки...';
 
       await ctx.telegram.editMessageText(
         message.chat.id,
         message.message_id,
         undefined,
-        resultMessage,
-        {
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: '✅ Подтвердить', callback_data: 'confirm_bundle' },
-                { text: '❌ Отменить', callback_data: 'cancel_bundle' }
-              ]
-            ]
-          }
-        }
+        resultMessage
       );
 
       // Update user state for bundle buying
@@ -2194,6 +2181,26 @@ bot.action('confirm_launch', async (ctx) => {
           mintAddress: result.mintAddress
         }
       });
+
+      // Ждем 15 секунд, чтобы транзакция создания токена была подтверждена
+      await new Promise(resolve => setTimeout(resolve, 15000));
+
+      // Обновляем сообщение
+      resultMessage = '✅ Токен успешно создан!\n\n';
+      resultMessage += `Mint Address: ${result.mintAddress}\n`;
+      resultMessage += `Transaction: https://solscan.io/tx/${result.signature}\n`;
+      resultMessage += `Создан с кошелька #${tokenData.walletNumber}\n\n`;
+      resultMessage += '🔄 Автоматически начинаем bundle покупку...';
+
+      await ctx.telegram.editMessageText(
+        message.chat.id,
+        message.message_id,
+        undefined,
+        resultMessage
+      );
+
+      // Автоматически запускаем процесс bundle покупки
+      await executeBundleBuy(ctx, userId, result.mintAddress, message);
 
     } catch (error) {
       console.error('Error in token creation:', error);
@@ -2310,153 +2317,9 @@ bot.action('confirm_bundle', async (ctx) => {
   }
 
   const loadingMsg = await ctx.reply('⏳ Выполняем bundle покупки...');
-  let successCount = 0;
-  let failCount = 0;
-  let totalBoughtSol = 0;
-  let lastError = '';
-
-  try {
-    // Проверяем существование токена и его bonding curve
-    try {
-      const connection = new Connection(process.env.RPC_URL || 'https://api.devnet.solana.com');
-      const mintPubkey = new PublicKey(mintAddress);
-      
-      // Проверяем существование токена
-      const mintInfo = await connection.getAccountInfo(mintPubkey);
-      if (!mintInfo) {
-        await ctx.telegram.editMessageText(
-          loadingMsg.chat.id,
-          loadingMsg.message_id,
-          undefined,
-          `❌ Ошибка: токен с адресом ${mintAddress} не найден. Пожалуйста, проверьте адрес.`
-        );
-        return;
-      }
-      
-      // Проверяем существование bonding curve
-      const [bondingCurvePublicKey] = await PublicKey.findProgramAddress(
-        [Buffer.from("bonding-curve"), mintPubkey.toBuffer()],
-        PUMP_FUN_PROGRAM_ID
-      );
-      
-      const bondingCurveInfo = await connection.getAccountInfo(bondingCurvePublicKey);
-      if (!bondingCurveInfo) {
-        await ctx.telegram.editMessageText(
-          loadingMsg.chat.id,
-          loadingMsg.message_id,
-          undefined,
-          `❌ Ошибка: bonding curve для токена ${mintAddress} не найдена.\n` +
-          `Возможно, это не токен Pump.fun или он был создан с использованием другой программы.`
-        );
-        return;
-      }
-    } catch (error) {
-      console.error('Error checking token:', error);
-      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-      await ctx.telegram.editMessageText(
-        loadingMsg.chat.id,
-        loadingMsg.message_id,
-        undefined,
-        `❌ Ошибка при проверке токена: ${errorMessage}`
-      );
-      return;
-    }
-
-    // Используем только кошельки 0-23 для bundle
-    const walletNumbers = Array.from({ length: 24 }, (_, i) => i);
-    
-    for (const walletNumber of walletNumbers) {
-      try {
-        const wallet = await walletService.getWallet(walletNumber);
-        if (!wallet) {
-          console.log(`Кошелек #${walletNumber} не найден, пропускаем`);
-          continue;
-        }
-
-        // Получаем актуальный баланс кошелька
-        const currentBalance = await transactionService.getWalletBalance(walletNumber);
-        
-        // Оставляем только 0.001 SOL на комиссию
-        const reserveForFee = 0.001;
-        const amountToSpend = Math.max(0, currentBalance - reserveForFee);
-
-        console.log(`Bundle wallet #${walletNumber} balance calculation:`, {
-          currentBalance,
-          reserveForFee,
-          amountToSpend,
-          willBeLeft: currentBalance - amountToSpend
-        });
-
-        if (amountToSpend > 0) {
-          const signature = await pumpFunService.buyTokens(
-            new PublicKey(mintAddress),
-            amountToSpend,
-            0, // minTokenAmount рассчитывается внутри buyTokens
-            wallet
-          );
-
-          successCount++;
-          totalBoughtSol += amountToSpend;
-
-          // Update progress
-          await ctx.telegram.editMessageText(
-            loadingMsg.chat.id,
-            loadingMsg.message_id,
-            undefined,
-            `⏳ Выполнено ${successCount} транзакций...\n` +
-            `💰 Всего потрачено: ${totalBoughtSol.toFixed(4)} SOL`
-          );
-
-          // Добавляем небольшую задержку между транзакциями
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        }
-      } catch (error) {
-        console.error(`Error in transaction for wallet #${walletNumber}:`, error);
-        lastError = error instanceof Error ? error.message : 'Unknown error';
-        failCount++;
-        
-        // Обновляем сообщение с информацией об ошибке
-        await ctx.telegram.editMessageText(
-          loadingMsg.chat.id,
-          loadingMsg.message_id,
-          undefined,
-          `⏳ Выполнено ${successCount} транзакций...\n` +
-          `💰 Всего потрачено: ${totalBoughtSol.toFixed(4)} SOL\n` +
-          `❌ Ошибок: ${failCount}\n` +
-          `Последняя ошибка: ${lastError.substring(0, 100)}${lastError.length > 100 ? '...' : ''}`
-        );
-      }
-    }
-
-    // Final summary
-    let summary = '📊 Результаты bundle покупки:\n\n';
-    summary += `✅ Успешно: ${successCount}\n`;
-    summary += `❌ Неудачно: ${failCount}\n`;
-    summary += `💰 Всего потрачено: ${totalBoughtSol.toFixed(4)} SOL\n\n`;
-    if (failCount > 0 && lastError) {
-      summary += `⚠️ Последняя ошибка: ${lastError.substring(0, 100)}${lastError.length > 100 ? '...' : ''}\n\n`;
-    }
-    summary += `🔗 Токен: https://pump.fun/coin/${mintAddress}`;
-
-    await ctx.telegram.editMessageText(
-      loadingMsg.chat.id,
-      loadingMsg.message_id,
-      undefined,
-      summary
-    );
-
-    // Clear user state
-    userStates.delete(userId);
-  } catch (error) {
-    console.error('Error in bundle execution:', error);
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
-    await ctx.telegram.editMessageText(
-      loadingMsg.chat.id,
-      loadingMsg.message_id,
-      undefined,
-      `❌ Ошибка при выполнении bundle покупок: ${errorMessage}`
-    );
-  }
+  
+  // Используем общую функцию для выполнения bundle покупки
+  await executeBundleBuy(ctx, userId, mintAddress, loadingMsg);
 });
 
 bot.action('cancel_bundle', async (ctx) => {
@@ -2777,3 +2640,200 @@ bot.action('confirm_market', async (ctx) => {
     await ctx.reply('❌ Ошибка при выполнении market making покупок');
   }
 });
+
+// Новая функция для выполнения bundle покупки
+async function executeBundleBuy(ctx: any, userId: string, mintAddress: string, loadingMsg: any) {
+  let successCount = 0;
+  let failCount = 0;
+  let totalBoughtSol = 0;
+  let lastError = '';
+
+  try {
+    // Проверяем существование токена и его bonding curve
+    try {
+      const connection = new Connection(process.env.RPC_URL || 'https://api.devnet.solana.com');
+      const mintPubkey = new PublicKey(mintAddress);
+      
+      // Проверяем существование токена с повторными попытками
+      let mintInfo = null;
+      let attempts = 0;
+      const maxAttempts = 5;
+      
+      while (!mintInfo && attempts < maxAttempts) {
+        attempts++;
+        try {
+          mintInfo = await connection.getAccountInfo(mintPubkey);
+          if (!mintInfo) {
+            await ctx.telegram.editMessageText(
+              loadingMsg.chat.id,
+              loadingMsg.message_id,
+              undefined,
+              `⏳ Ожидаем подтверждения токена в блокчейне (попытка ${attempts}/${maxAttempts})...`
+            );
+            // Ждем 5 секунд перед следующей попыткой
+            await new Promise(resolve => setTimeout(resolve, 5000));
+          }
+        } catch (e) {
+          console.error(`Attempt ${attempts} failed:`, e);
+          await new Promise(resolve => setTimeout(resolve, 5000));
+        }
+      }
+      
+      if (!mintInfo) {
+        await ctx.telegram.editMessageText(
+          loadingMsg.chat.id,
+          loadingMsg.message_id,
+          undefined,
+          `⚠️ Токен с адресом ${mintAddress} не найден после ${maxAttempts} попыток. Возможно, транзакция еще не подтверждена. Попробуйте выполнить bundle покупку позже.`
+        );
+        return;
+      }
+      
+      // Проверяем существование bonding curve с повторными попытками
+      const [bondingCurvePublicKey] = await PublicKey.findProgramAddress(
+        [Buffer.from("bonding-curve"), mintPubkey.toBuffer()],
+        PUMP_FUN_PROGRAM_ID
+      );
+      
+      let bondingCurveInfo = null;
+      attempts = 0;
+      
+      while (!bondingCurveInfo && attempts < maxAttempts) {
+        attempts++;
+        try {
+          bondingCurveInfo = await connection.getAccountInfo(bondingCurvePublicKey);
+          if (!bondingCurveInfo) {
+            await ctx.telegram.editMessageText(
+              loadingMsg.chat.id,
+              loadingMsg.message_id,
+              undefined,
+              `⏳ Ожидаем создания bonding curve (попытка ${attempts}/${maxAttempts})...`
+            );
+            // Ждем 5 секунд перед следующей попыткой
+            await new Promise(resolve => setTimeout(resolve, 5000));
+          }
+        } catch (e) {
+          console.error(`Bonding curve attempt ${attempts} failed:`, e);
+          await new Promise(resolve => setTimeout(resolve, 5000));
+        }
+      }
+      
+      if (!bondingCurveInfo) {
+        await ctx.telegram.editMessageText(
+          loadingMsg.chat.id,
+          loadingMsg.message_id,
+          undefined,
+          `❌ Ошибка: bonding curve для токена ${mintAddress} не найдена после ${maxAttempts} попыток.\n` +
+          `Возможно, это не токен Pump.fun или он был создан с использованием другой программы.`
+        );
+        return;
+      }
+      
+      // Если мы дошли до этого места, значит токен и bonding curve существуют
+      await ctx.telegram.editMessageText(
+        loadingMsg.chat.id,
+        loadingMsg.message_id,
+        undefined,
+        `✅ Токен и bonding curve найдены! Начинаем bundle покупку...`
+      );
+      
+    } catch (error) {
+      console.error('Error checking token:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      await ctx.telegram.editMessageText(
+        loadingMsg.chat.id,
+        loadingMsg.message_id,
+        undefined,
+        `❌ Ошибка при проверке токена: ${errorMessage}`
+      );
+      return;
+    }
+
+    // Используем только кошельки 0-23 для bundle
+    const walletNumbers = Array.from({ length: 24 }, (_, i) => i);
+    
+    for (const walletNumber of walletNumbers) {
+      try {
+        const wallet = await walletService.getWallet(walletNumber);
+        if (!wallet) {
+          console.log(`Кошелек #${walletNumber} не найден, пропускаем`);
+          continue;
+        }
+
+        // Получаем актуальный баланс кошелька
+        const currentBalance = await transactionService.getWalletBalance(walletNumber);
+        
+        // Оставляем только 0.001 SOL на комиссию
+        const reserveForFee = 0.001;
+        const amountToSpend = Math.max(0, currentBalance - reserveForFee);
+
+        console.log(`Bundle wallet #${walletNumber} balance calculation:`, {
+          currentBalance,
+          reserveForFee,
+          amountToSpend,
+          willBeLeft: currentBalance - amountToSpend
+        });
+
+        if (amountToSpend > 0) {
+          const signature = await pumpFunService.buyTokens(
+            new PublicKey(mintAddress),
+            amountToSpend,
+            0, // minTokenAmount рассчитывается внутри buyTokens
+            wallet
+          );
+
+          successCount++;
+          totalBoughtSol += amountToSpend;
+
+          // Update progress
+          await ctx.telegram.editMessageText(
+            loadingMsg.chat.id,
+            loadingMsg.message_id,
+            undefined,
+            `⏳ Выполнено ${successCount} транзакций...\n` +
+            `💰 Всего потрачено: ${totalBoughtSol.toFixed(4)} SOL`
+          );
+
+          // Добавляем небольшую задержку между транзакциями
+          await new Promise(resolve => setTimeout(resolve, 1000));
+        }
+      } catch (error) {
+        console.error(`Error in transaction for wallet #${walletNumber}:`, error);
+        lastError = error instanceof Error ? error.message : 'Unknown error';
+        failCount++;
+      }
+    }
+
+    // Финальное сообщение
+    let finalMessage = `✅ Bundle покупка завершена!\n\n`;
+    finalMessage += `📊 Статистика:\n`;
+    finalMessage += `✓ Успешных транзакций: ${successCount}\n`;
+    finalMessage += `✗ Неудачных транзакций: ${failCount}\n`;
+    finalMessage += `💰 Всего потрачено: ${totalBoughtSol.toFixed(4)} SOL\n\n`;
+    
+    if (lastError) {
+      finalMessage += `⚠️ Последняя ошибка: ${lastError}\n\n`;
+    }
+    
+    finalMessage += `🔗 Токен: ${mintAddress}\n`;
+    finalMessage += `🔍 Просмотреть на Solscan: https://solscan.io/token/${mintAddress}`;
+
+    await ctx.telegram.editMessageText(
+      loadingMsg.chat.id,
+      loadingMsg.message_id,
+      undefined,
+      finalMessage
+    );
+
+  } catch (error) {
+    console.error('Error in bundle buy execution:', error);
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    
+    await ctx.telegram.editMessageText(
+      loadingMsg.chat.id,
+      loadingMsg.message_id,
+      undefined,
+      `❌ Ошибка при выполнении bundle покупки: ${errorMessage}`
+    );
+  }
+}
