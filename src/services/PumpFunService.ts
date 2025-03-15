@@ -471,6 +471,7 @@ export class PumpFunService {
     payer: Keypair
   ): Promise<string> {
     try {
+      console.log(`Attempting to buy tokens for mint: ${mint.toBase58()}`);
       const feeRecipient = new PublicKey('62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV');
       console.log('Using fee recipient:', feeRecipient.toBase58());
 
@@ -479,10 +480,22 @@ export class PumpFunService {
         [Buffer.from("bonding-curve"), mint.toBuffer()],
         PUMP_FUN_PROGRAM_ID
       );
+      console.log('Bonding curve PDA:', bondingCurvePublicKey.toBase58());
 
       // Get bonding curve data to calculate price
       const bondingCurveInfo = await this.connection.getAccountInfo(bondingCurvePublicKey);
-      if (!bondingCurveInfo) throw new Error('Bonding curve not found');
+      if (!bondingCurveInfo) {
+        console.error(`Bonding curve not found for mint: ${mint.toBase58()}`);
+        console.error(`Attempted to find bonding curve at: ${bondingCurvePublicKey.toBase58()}`);
+        
+        // Проверяем, существует ли сам токен
+        const mintInfo = await this.connection.getAccountInfo(mint);
+        if (!mintInfo) {
+          throw new Error(`Token mint ${mint.toBase58()} not found. Please verify the token address.`);
+        }
+        
+        throw new Error(`Bonding curve not found for token ${mint.toBase58()}. This token may not be a Pump.fun token or may have been created with a different program.`);
+      }
 
       // Десериализуем данные bonding curve
       const bondingCurveData = bondingCurveInfo.data;
@@ -491,53 +504,32 @@ export class PumpFunService {
 
       // Конвертируем все значения в lamports для точности
       const tokenDecimals = 6;
-      // Вычитаем комиссию за транзакцию из суммы покупки
-      const txFee = 5000; // 0.000005 SOL
-      const amountInLamports = BigInt(Math.floor(amountInSol * LAMPORTS_PER_SOL)) - BigInt(txFee);
+      const amountInLamports = BigInt(Math.floor(amountInSol * LAMPORTS_PER_SOL));
       
-      // Используем BigInt для точных вычислений
+      // Рассчитываем ожидаемое количество токенов с использованием BigInt
       const x = virtualSolReserves;
       const y = virtualTokenReserves;
       const deltaX = amountInLamports;
 
-      console.log('Initial values:', {
-        virtualTokenReserves: virtualTokenReserves.toString(),
-        virtualSolReserves: virtualSolReserves.toString(),
-        amountInLamports: amountInLamports.toString(),
-        amountInSol,
-        txFee: txFee / LAMPORTS_PER_SOL
-      });
-      
-      // Используем промежуточные значения с плавающей точкой для большей точности
-      const xFloat = Number(x) / LAMPORTS_PER_SOL;
-      const yFloat = Number(y) / Math.pow(10, tokenDecimals);
-      const deltaXFloat = Number(deltaX) / LAMPORTS_PER_SOL;
-      
-      // Рассчитываем ожидаемое количество токенов по формуле bonding curve
-      // Formula: deltaY = y * ((1 + deltaX/x)^0.5 - 1)
-      const ratio = deltaXFloat / xFloat;
-      const sqrtTerm = Math.sqrt(1 + ratio);
-      const multiplier = sqrtTerm - 1;
-      
-      // Конвертируем результат обратно в lamports
-      const expectedTokenAmount = BigInt(Math.floor(yFloat * multiplier * Math.pow(10, tokenDecimals)));
-      
-      // Устанавливаем minTokenAmount как 90% от ожидаемого количества для учета проскальзывания
-      const minTokenAmountLamports = expectedTokenAmount * BigInt(90) / BigInt(100);
+      // Формула: deltaY = y * deltaX / (x + deltaX)
+      // Используем BigInt для точности
+      const numerator = y * deltaX;
+      const denominator = x + deltaX;
+      let expectedTokenAmount = numerator / denominator;
+
+      // Добавляем небольшой запас на проскальзывание (80%)
+      // Уменьшаем минимальное количество токенов для покупки, чтобы увеличить шансы на успешную транзакцию
+      const minTokenAmountLamports = (expectedTokenAmount * BigInt(80)) / BigInt(100);
       const maxSolCostLamports = amountInLamports;
 
-      console.log('Calculation details:', {
-        xFloat,
-        yFloat,
-        deltaXFloat,
-        ratio,
-        sqrtTerm,
-        multiplier,
-        expectedTokenAmount: Number(expectedTokenAmount) / Math.pow(10, tokenDecimals),
-        minTokenAmount: Number(minTokenAmountLamports) / Math.pow(10, tokenDecimals),
-        maxSolCost: Number(maxSolCostLamports) / LAMPORTS_PER_SOL,
-        amountInSol,
-        amountInLamports: amountInLamports.toString()
+      console.log('Buy parameters:', {
+        virtualTokenReserves: virtualTokenReserves.toString(),
+        virtualSolReserves: virtualSolReserves.toString(),
+        amountInSol: amountInSol.toFixed(6),
+        amountInLamports: amountInLamports.toString(),
+        expectedTokenAmount: (Number(expectedTokenAmount) / Math.pow(10, tokenDecimals)).toFixed(6),
+        minTokenAmount: (Number(minTokenAmountLamports) / Math.pow(10, tokenDecimals)).toFixed(6),
+        maxSolCost: (Number(maxSolCostLamports) / LAMPORTS_PER_SOL).toFixed(6),
       });
 
       // Get token accounts
@@ -568,7 +560,6 @@ export class PumpFunService {
       // Prepare buy instruction data
       const buyDiscriminator = Buffer.from([102, 6, 61, 18, 1, 218, 235, 234]);
       
-      // Create buffers for the instruction data
       const minTokenAmountBuffer = Buffer.alloc(8);
       minTokenAmountBuffer.writeBigUInt64LE(minTokenAmountLamports);
       const maxSolCostBuffer = Buffer.alloc(8);
@@ -581,10 +572,9 @@ export class PumpFunService {
       ]);
 
       console.log('Instruction data:', {
-        minTokenAmountLamports: minTokenAmountLamports.toString(),
-        maxSolCostLamports: maxSolCostLamports.toString(),
-        minTokenAmountHex: minTokenAmountBuffer.toString('hex'),
-        maxSolCostHex: maxSolCostBuffer.toString('hex')
+        minTokenAmount: minTokenAmountLamports.toString(),
+        maxSolCost: maxSolCostLamports.toString(),
+        dataHex: data.toString('hex'),
       });
 
       // Create buy instruction
@@ -614,26 +604,29 @@ export class PumpFunService {
       transaction.recentBlockhash = blockhash;
       transaction.feePayer = payer.publicKey;
 
-      console.log('Sending transaction...');
-      const signature = await this.sendAndConfirmTransaction(
+      console.log('Sending transaction with', amountInSol.toFixed(6), 'SOL...');
+      const signature = await sendAndConfirmTransaction(
+        this.connection,
         transaction,
         [payer],
-        { commitment: 'confirmed' }
+        { 
+          commitment: 'confirmed',
+          skipPreflight: false,
+          preflightCommitment: 'confirmed'
+        }
       );
 
       // Проверяем результат транзакции
-      const txInfo = await this.connection.getTransaction(signature, {
+      const txInfo = await this.connection.getTransaction(signature, { 
         commitment: 'confirmed',
         maxSupportedTransactionVersion: 0
       });
-
-      if (txInfo) {
-        console.log('Transaction post-execution info:', {
-          fee: txInfo.meta?.fee,
-          preBalances: txInfo.meta?.preBalances,
-          postBalances: txInfo.meta?.postBalances,
-          logMessages: txInfo.meta?.logMessages
-        });
+      
+      if (txInfo?.meta?.postBalances && txInfo.meta.preBalances) {
+        const solSpent = (txInfo.meta.preBalances[0] - txInfo.meta.postBalances[0]) / LAMPORTS_PER_SOL;
+        console.log(`Actual SOL spent: ${solSpent.toFixed(6)} SOL`);
+        console.log(`Expected SOL spent: ${amountInSol.toFixed(6)} SOL`);
+        console.log(`Percentage of expected amount spent: ${((solSpent / amountInSol) * 100).toFixed(2)}%`);
       }
 
       console.log(`Token purchase successful! Transaction: ${signature}`);

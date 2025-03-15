@@ -9,12 +9,14 @@ import fetch from 'node-fetch';
 import * as fs from 'fs';
 import * as path from 'path';
 import dotenv from 'dotenv';
-import { Keypair, LAMPORTS_PER_SOL, SendTransactionError } from '@solana/web3.js';
+import { Keypair, LAMPORTS_PER_SOL, SendTransactionError, Connection, PublicKey } from '@solana/web3.js';
 import { message } from 'telegraf/filters';
 import sharp from 'sharp';
-import { PublicKey } from '@solana/web3.js';
 import { DistributionStateRepository } from '../repositories/DistributionStateRepository';
 import { DatabaseService } from '../services/DatabaseService';
+
+// Константы программы Pump.fun
+const PUMP_FUN_PROGRAM_ID = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
 
 dotenv.config();
 
@@ -42,7 +44,8 @@ async function initializeServices() {
   
   transactionService = new TransactionService(walletService, distributionStateRepository);
   walletSetService = new WalletSetService();
-  pumpFunService = new PumpFunService(walletService);
+  // Используем URL RPC из переменной окружения
+  pumpFunService = new PumpFunService(walletService, process.env.RPC_URL);
   tokenHistoryService = new TokenHistoryService();
 }
 
@@ -205,9 +208,26 @@ bot.command('start', async (ctx) => {
   console.log('Received start command from:', ctx.from?.username);
   
   try {
-    const devWallet = walletService.getDevWallet();
+    // Проверяем, инициализирован ли dev wallet
+    let devWallet = walletService.getDevWallet();
+    
+    // Если dev wallet не инициализирован, создаем все кошельки
     if (!devWallet) {
-      throw new Error('Dev wallet not initialized');
+      console.log('Dev wallet not initialized. Generating wallets...');
+      
+      // Генерируем все кошельки (включая dev wallet)
+      const result = await walletService.generateWallets(false);
+      console.log(`Generated ${result.wallets.length} wallets`);
+      
+      // Отправляем сообщение о создании кошельков
+      await ctx.reply(
+        '✅ Кошельки успешно созданы!\n\n' +
+        '📝 Кошелек #0 - dev кошелек\n' +
+        '📝 Кошельки #1-23 - bundle кошельки\n' +
+        '📝 Кошелек #24 - bundle payer кошелек\n' +
+        '📝 Кошелек #25 - market making payer кошелек\n' +
+        '📝 Кошельки #26-100 - market making кошельки'
+      );
     }
     
     const balance = await transactionService.getWalletBalance(0);
@@ -639,7 +659,7 @@ bot.hears(LAUNCH_MENU_BUTTONS.BUY_TOKEN, async (ctx) => {
           inline_keyboard: [
             [
               { text: '🔄 Одиночная покупка', callback_data: 'buy_single' },
-              { text: '📦 Bundle покупка', callback_data: 'buy_bundle' }
+              { text: '💰 Выкупить токен', callback_data: 'buy_bundle' }
             ]
           ]
         }
@@ -830,10 +850,161 @@ bot.action(/create_(with|without)_lut/, async (ctx) => {
       }
     }
     
-    ctx.reply(`Starting wallet generation process${createWithLUT ? ' with Lookup Tables' : ''}...\n` +
-              'This may take a few minutes...');
+    // Отправляем начальное сообщение
+    const initialMessage = await ctx.reply(
+      `🔄 Начинаю процесс генерации кошельков${createWithLUT ? ' с Lookup Tables' : ''}...\n` +
+      'Это может занять несколько минут...'
+    );
     
+    // Создаем обработчик прогресса
+    let progressMessage: any = initialMessage;
+    let lastUpdateTime = Date.now();
+    
+    // Функция для обновления сообщения о прогрессе
+    const updateProgress = async (message: string) => {
+      // Обновляем сообщение не чаще чем раз в 2 секунды
+      const now = Date.now();
+      if (now - lastUpdateTime < 2000) {
+        return;
+      }
+      lastUpdateTime = now;
+      
+      try {
+        progressMessage = await ctx.telegram.editMessageText(
+          ctx.chat!.id,
+          progressMessage.message_id,
+          undefined,
+          message
+        );
+      } catch (error) {
+        console.error('Error updating progress message:', error);
+      }
+    };
+    
+    // Обновляем сообщение о прогрессе
+    if (createWithLUT) {
+      await updateProgress(
+        '🔄 Генерация кошельков...\n' +
+        '⏳ Шаг 1/5: Создание 101 кошелька Solana'
+      );
+    } else {
+      await updateProgress(
+        '🔄 Генерация кошельков...\n' +
+        '⏳ Шаг 1/2: Создание 101 кошелька Solana'
+      );
+    }
+    
+    // Устанавливаем обработчики событий для LookupTableService
+    const originalConsoleLog = console.log;
+    if (createWithLUT) {
+      // Подписываемся на события LookupTableService
+      console.log = function(...args) {
+        originalConsoleLog.apply(console, args);
+        
+        const message = args.join(' ');
+        
+        if (message.includes('Creating bundle lookup table')) {
+          updateProgress(
+            '🔄 Генерация кошельков...\n' +
+            '✅ Шаг 1/5: Создание 101 кошелька Solana - Завершено\n' +
+            '⏳ Шаг 2/5: Создание Lookup Table для bundle кошельков'
+          );
+        } else if (message.includes('Created lookup table') && message.includes('bundle')) {
+          updateProgress(
+            '🔄 Генерация кошельков...\n' +
+            '✅ Шаг 1/5: Создание 101 кошелька Solana - Завершено\n' +
+            '✅ Шаг 2/5: Создание Lookup Table для bundle кошельков - Завершено\n' +
+            '⏳ Шаг 3/5: Добавление адресов в Lookup Table для bundle кошельков'
+          );
+        } else if (message.includes('Extended lookup table') && message.includes('bundle')) {
+          updateProgress(
+            '🔄 Генерация кошельков...\n' +
+            '✅ Шаг 1/5: Создание 101 кошелька Solana - Завершено\n' +
+            '✅ Шаг 2/5: Создание Lookup Table для bundle кошельков - Завершено\n' +
+            '✅ Шаг 3/5: Добавление адресов в Lookup Table для bundle кошельков - Завершено\n' +
+            '⏳ Шаг 4/5: Создание Lookup Table для market making кошельков'
+          );
+        } else if (message.includes('Creating market_making lookup table')) {
+          updateProgress(
+            '🔄 Генерация кошельков...\n' +
+            '✅ Шаг 1/5: Создание 101 кошелька Solana - Завершено\n' +
+            '✅ Шаг 2/5: Создание Lookup Table для bundle кошельков - Завершено\n' +
+            '✅ Шаг 3/5: Добавление адресов в Lookup Table для bundle кошельков - Завершено\n' +
+            '⏳ Шаг 4/5: Создание Lookup Table для market making кошельков'
+          );
+        } else if (message.includes('Created lookup table') && message.includes('market')) {
+          updateProgress(
+            '🔄 Генерация кошельков...\n' +
+            '✅ Шаг 1/5: Создание 101 кошелька Solana - Завершено\n' +
+            '✅ Шаг 2/5: Создание Lookup Table для bundle кошельков - Завершено\n' +
+            '✅ Шаг 3/5: Добавление адресов в Lookup Table для bundle кошельков - Завершено\n' +
+            '✅ Шаг 4/5: Создание Lookup Table для market making кошельков - Завершено\n' +
+            '⏳ Шаг 5/5: Добавление адресов в Lookup Table для market making кошельков'
+          );
+        } else if (message.includes('Extended lookup table') && message.includes('market')) {
+          updateProgress(
+            '🔄 Генерация кошельков...\n' +
+            '✅ Шаг 1/5: Создание 101 кошелька Solana - Завершено\n' +
+            '✅ Шаг 2/5: Создание Lookup Table для bundle кошельков - Завершено\n' +
+            '✅ Шаг 3/5: Добавление адресов в Lookup Table для bundle кошельков - Завершено\n' +
+            '✅ Шаг 4/5: Создание Lookup Table для market making кошельков - Завершено\n' +
+            '⏳ Шаг 5/5: Добавление адресов в Lookup Table для market making кошельков'
+          );
+        } else if (message.includes('Saving wallets to database')) {
+          updateProgress(
+            '🔄 Генерация кошельков...\n' +
+            '✅ Шаг 1/5: Создание 101 кошелька Solana - Завершено\n' +
+            '✅ Шаг 2/5: Создание Lookup Table для bundle кошельков - Завершено\n' +
+            '✅ Шаг 3/5: Добавление адресов в Lookup Table для bundle кошельков - Завершено\n' +
+            '✅ Шаг 4/5: Создание Lookup Table для market making кошельков - Завершено\n' +
+            '✅ Шаг 5/5: Добавление адресов в Lookup Table для market making кошельков - Завершено\n' +
+            '⏳ Сохранение кошельков в базу данных...'
+          );
+        } else if (message.includes('Wallets generated, sending file')) {
+          updateProgress(
+            '🔄 Генерация кошельков...\n' +
+            '✅ Шаг 1/5: Создание 101 кошелька Solana - Завершено\n' +
+            '✅ Шаг 2/5: Создание Lookup Table для bundle кошельков - Завершено\n' +
+            '✅ Шаг 3/5: Добавление адресов в Lookup Table для bundle кошельков - Завершено\n' +
+            '✅ Шаг 4/5: Создание Lookup Table для market making кошельков - Завершено\n' +
+            '✅ Шаг 5/5: Добавление адресов в Lookup Table для market making кошельков - Завершено\n' +
+            '✅ Сохранение кошельков в базу данных - Завершено\n' +
+            '📤 Отправка файла с кошельками...'
+          );
+        }
+      };
+    }
+    
+    // Генерируем кошельки
     const result = await walletService.generateWallets(createWithLUT);
+    
+    // Восстанавливаем оригинальную функцию console.log
+    if (createWithLUT) {
+      console.log = originalConsoleLog;
+    }
+    
+    // Обновляем сообщение о завершении
+    if (createWithLUT) {
+      await updateProgress(
+        '✅ Генерация кошельков успешно завершена!\n' +
+        '✅ Шаг 1/5: Создание 101 кошелька Solana - Завершено\n' +
+        '✅ Шаг 2/5: Создание Lookup Table для bundle кошельков - Завершено\n' +
+        '✅ Шаг 3/5: Добавление адресов в Lookup Table для bundle кошельков - Завершено\n' +
+        '✅ Шаг 4/5: Создание Lookup Table для market making кошельков - Завершено\n' +
+        '✅ Шаг 5/5: Добавление адресов в Lookup Table для market making кошельков - Завершено\n' +
+        '✅ Сохранение кошельков в базу данных - Завершено\n' +
+        '📤 Отправка файла с кошельками...'
+      );
+    } else {
+      await updateProgress(
+        '✅ Генерация кошельков успешно завершена!\n' +
+        '✅ Шаг 1/2: Создание 101 кошелька Solana - Завершено\n' +
+        '✅ Шаг 2/2: Сохранение кошельков в базу данных - Завершено\n' +
+        '📤 Отправка файла с кошельками...'
+      );
+    }
+    
+    // Обрабатываем результат
     await handleWalletCreationResult(ctx, result, createWithLUT);
   } catch (error) {
     console.error('Error generating wallets:', error);
@@ -1093,7 +1264,7 @@ bot.command('buytoken', async (ctx) => {
           inline_keyboard: [
             [
               { text: '🔄 Одиночная покупка', callback_data: 'buy_single' },
-              { text: '📦 Bundle покупка', callback_data: 'buy_bundle' }
+              { text: '💰 Выкупить токен', callback_data: 'buy_bundle' }
             ]
           ]
         }
@@ -1422,7 +1593,7 @@ bot.on('text', async (ctx) => {
             });
           }
 
-          resultMessage += `\n🔗 Токен: https://pump.fun/token/${mintAddress}`;
+          resultMessage += `\n🔗 Токен: https://pump.fun/coin/${mintAddress}`;
 
           await ctx.telegram.editMessageText(
             message.chat.id,
@@ -2130,12 +2301,67 @@ bot.action('confirm_bundle', async (ctx) => {
     return;
   }
 
+  // Проверяем валидность адреса токена
+  try {
+    new PublicKey(mintAddress);
+  } catch (error) {
+    await ctx.reply(`❌ Ошибка: недействительный адрес токена (${mintAddress})`);
+    return;
+  }
+
   const loadingMsg = await ctx.reply('⏳ Выполняем bundle покупки...');
   let successCount = 0;
   let failCount = 0;
   let totalBoughtSol = 0;
+  let lastError = '';
 
   try {
+    // Проверяем существование токена и его bonding curve
+    try {
+      const connection = new Connection(process.env.RPC_URL || 'https://api.devnet.solana.com');
+      const mintPubkey = new PublicKey(mintAddress);
+      
+      // Проверяем существование токена
+      const mintInfo = await connection.getAccountInfo(mintPubkey);
+      if (!mintInfo) {
+        await ctx.telegram.editMessageText(
+          loadingMsg.chat.id,
+          loadingMsg.message_id,
+          undefined,
+          `❌ Ошибка: токен с адресом ${mintAddress} не найден. Пожалуйста, проверьте адрес.`
+        );
+        return;
+      }
+      
+      // Проверяем существование bonding curve
+      const [bondingCurvePublicKey] = await PublicKey.findProgramAddress(
+        [Buffer.from("bonding-curve"), mintPubkey.toBuffer()],
+        PUMP_FUN_PROGRAM_ID
+      );
+      
+      const bondingCurveInfo = await connection.getAccountInfo(bondingCurvePublicKey);
+      if (!bondingCurveInfo) {
+        await ctx.telegram.editMessageText(
+          loadingMsg.chat.id,
+          loadingMsg.message_id,
+          undefined,
+          `❌ Ошибка: bonding curve для токена ${mintAddress} не найдена.\n` +
+          `Возможно, это не токен Pump.fun или он был создан с использованием другой программы.`
+        );
+        return;
+      }
+    } catch (error) {
+      console.error('Error checking token:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      await ctx.telegram.editMessageText(
+        loadingMsg.chat.id,
+        loadingMsg.message_id,
+        undefined,
+        `❌ Ошибка при проверке токена: ${errorMessage}`
+      );
+      return;
+    }
+
     // Используем только кошельки 0-23 для bundle
     const walletNumbers = Array.from({ length: 24 }, (_, i) => i);
     
@@ -2186,7 +2412,19 @@ bot.action('confirm_bundle', async (ctx) => {
         }
       } catch (error) {
         console.error(`Error in transaction for wallet #${walletNumber}:`, error);
+        lastError = error instanceof Error ? error.message : 'Unknown error';
         failCount++;
+        
+        // Обновляем сообщение с информацией об ошибке
+        await ctx.telegram.editMessageText(
+          loadingMsg.chat.id,
+          loadingMsg.message_id,
+          undefined,
+          `⏳ Выполнено ${successCount} транзакций...\n` +
+          `💰 Всего потрачено: ${totalBoughtSol.toFixed(4)} SOL\n` +
+          `❌ Ошибок: ${failCount}\n` +
+          `Последняя ошибка: ${lastError.substring(0, 100)}${lastError.length > 100 ? '...' : ''}`
+        );
       }
     }
 
@@ -2195,7 +2433,10 @@ bot.action('confirm_bundle', async (ctx) => {
     summary += `✅ Успешно: ${successCount}\n`;
     summary += `❌ Неудачно: ${failCount}\n`;
     summary += `💰 Всего потрачено: ${totalBoughtSol.toFixed(4)} SOL\n\n`;
-    summary += `🔗 Токен: https://pump.fun/token/${mintAddress}`;
+    if (failCount > 0 && lastError) {
+      summary += `⚠️ Последняя ошибка: ${lastError.substring(0, 100)}${lastError.length > 100 ? '...' : ''}\n\n`;
+    }
+    summary += `🔗 Токен: https://pump.fun/coin/${mintAddress}`;
 
     await ctx.telegram.editMessageText(
       loadingMsg.chat.id,
@@ -2208,7 +2449,13 @@ bot.action('confirm_bundle', async (ctx) => {
     userStates.delete(userId);
   } catch (error) {
     console.error('Error in bundle execution:', error);
-    await ctx.reply('❌ Ошибка при выполнении bundle покупок');
+    const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+    await ctx.telegram.editMessageText(
+      loadingMsg.chat.id,
+      loadingMsg.message_id,
+      undefined,
+      `❌ Ошибка при выполнении bundle покупок: ${errorMessage}`
+    );
   }
 });
 
@@ -2514,7 +2761,7 @@ bot.action('confirm_market', async (ctx) => {
     summary += `✅ Успешно: ${successCount}\n`;
     summary += `❌ Неудачно: ${failCount}\n`;
     summary += `💰 Всего потрачено: ${totalBoughtSol.toFixed(4)} SOL\n\n`;
-    summary += `🔗 Токен: https://pump.fun/token/${userState.mintAddress}`;
+    summary += `🔗 Токен: https://pump.fun/coin/${userState.mintAddress}`;
 
     await ctx.telegram.editMessageText(
       loadingMsg.chat.id,

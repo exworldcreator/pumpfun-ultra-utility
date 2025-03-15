@@ -198,12 +198,24 @@ export class WalletService {
       // Try to load dev wallet first
       const devWalletPath = path.join(__dirname, '../../dev-wallet.json');
       if (fs.existsSync(devWalletPath)) {
-        const devWalletData = JSON.parse(fs.readFileSync(devWalletPath, 'utf8'));
-        const secretKey = Buffer.from(devWalletData.privateKey, 'base64');
-        const devKeypair = Keypair.fromSecretKey(secretKey);
-        this.devWallet = devKeypair;
-        this.devWalletPublicKey = devKeypair.publicKey.toString();
-        this.wallets.set(0, devKeypair);
+        try {
+          const devWalletData = JSON.parse(fs.readFileSync(devWalletPath, 'utf8'));
+          const secretKey = Buffer.from(devWalletData.privateKey, 'base64');
+          const devKeypair = Keypair.fromSecretKey(secretKey);
+          this.devWallet = devKeypair;
+          this.devWalletPublicKey = devKeypair.publicKey.toString();
+          this.wallets.set(0, devKeypair);
+          console.log('Dev wallet loaded successfully from file');
+        } catch (error) {
+          console.error('Error loading dev wallet from file, will be created later:', error);
+          // Удаляем файл с неверным форматом
+          try {
+            fs.unlinkSync(devWalletPath);
+            console.log('Removed invalid dev-wallet.json file');
+          } catch (unlinkError) {
+            console.error('Error removing invalid dev-wallet.json file:', unlinkError);
+          }
+        }
       }
 
       // Try to load from wallet sets
@@ -418,14 +430,35 @@ export class WalletService {
       // Обновляем dev wallet в базе данных, если используем базу данных
       if (this.useDatabase) {
         try {
-          await this.dbService.query(
-            `UPDATE wallets SET public_key = $1, private_key = $2, updated_at = CURRENT_TIMESTAMP 
-             WHERE wallet_number = 0`,
-            [
-              wallet.publicKey.toString(),
-              Buffer.from(wallet.secretKey).toString('base64')
-            ]
+          // Проверяем, существует ли запись для dev wallet
+          const result = await this.dbService.query(
+            'SELECT COUNT(*) FROM wallets WHERE wallet_number = 0 AND set_id = $1',
+            [this.activeWalletSetId || 'default']
           );
+          
+          if (parseInt(result.rows[0].count) > 0) {
+            // Обновляем существующую запись
+            await this.dbService.query(
+              `UPDATE wallets SET public_key = $1, private_key = $2 
+               WHERE wallet_number = 0 AND set_id = $3`,
+              [
+                wallet.publicKey.toString(),
+                Buffer.from(wallet.secretKey).toString('base64'),
+                this.activeWalletSetId || 'default'
+              ]
+            );
+          } else {
+            // Вставляем новую запись
+            await this.dbService.query(
+              `INSERT INTO wallets (wallet_number, public_key, private_key, wallet_type, set_id) 
+               VALUES (0, $1, $2, 'dev', $3)`,
+              [
+                wallet.publicKey.toString(),
+                Buffer.from(wallet.secretKey).toString('base64'),
+                this.activeWalletSetId || 'default'
+              ]
+            );
+          }
         } catch (error) {
           console.error('Error updating dev wallet in database:', error);
         }
@@ -446,16 +479,32 @@ export class WalletService {
     return this.devWalletPublicKey || null;
   }
 
-  getDevWallet(): Keypair | null {
+  public getDevWallet(): Keypair | null {
     return this.devWallet;
   }
 
   async generateWallets(createLookupTables: boolean = false): Promise<WalletGenerationResult> {
     const wallets: WalletData[] = [];
     
-    // First, make sure we have a dev wallet
+    // First, make sure we have a dev wallet or create one
     if (!this.devWallet) {
-      throw new Error('Dev wallet not initialized');
+      console.log('Dev wallet not initialized, creating a new one');
+      const newDevWallet = Keypair.generate();
+      await this.setDevWallet(newDevWallet);
+      
+      // Сохраняем dev wallet в файл
+      const devWalletPath = path.join(__dirname, '../../dev-wallet.json');
+      const devWalletData = {
+        publicKey: newDevWallet.publicKey.toString(),
+        privateKey: Buffer.from(newDevWallet.secretKey).toString('base64')
+      };
+      fs.writeFileSync(devWalletPath, JSON.stringify(devWalletData, null, 2));
+      console.log('Dev wallet saved to file');
+    }
+    
+    // Проверяем, что dev wallet точно инициализирован
+    if (!this.devWallet) {
+      throw new Error('Failed to initialize dev wallet');
     }
     
     // Add dev wallet to the list
@@ -525,7 +574,7 @@ export class WalletService {
     let marketMakingLUT: string | undefined;
     let error: string | undefined;
 
-    if (createLookupTables) {
+    if (createLookupTables && this.devWallet) {
       try {
         // Use the dev wallet for LUT creation
         const devWalletData = {
