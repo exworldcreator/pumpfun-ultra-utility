@@ -36,3 +36,6 @@ Thumbs.db
 # Database
 *.sql
 *.dump
+
+# Other
+main.py
