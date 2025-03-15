@@ -103,14 +103,24 @@ export class WalletService {
         await this.initializeDatabaseFromFiles();
       }
       
-      // Получаем все кошельки из базы данных
-      let result = await this.dbService.query('SELECT * FROM wallets ORDER BY wallet_number');
+      // Используем 'default' как set_id, если activeWalletSetId не установлен
+      const setId = this.activeWalletSetId || 'default';
+      console.log(`Loading wallets for set_id: ${setId}`);
+      
+      // Получаем кошельки из базы данных для активного набора
+      let result = await this.dbService.query(
+        'SELECT * FROM wallets WHERE set_id = $1 ORDER BY wallet_number',
+        [setId]
+      );
       
       if (result.rows.length === 0) {
-        console.log('No wallets found in the database. Initializing from files...');
+        console.log(`No wallets found in the database for set_id: ${setId}. Initializing from files...`);
         await this.initializeDatabaseFromFiles();
         // Повторно получаем кошельки после инициализации
-        result = await this.dbService.query('SELECT * FROM wallets ORDER BY wallet_number');
+        result = await this.dbService.query(
+          'SELECT * FROM wallets WHERE set_id = $1 ORDER BY wallet_number',
+          [setId]
+        );
       }
       
       // Загружаем кошельки в память
@@ -127,7 +137,7 @@ export class WalletService {
         }
       });
       
-      console.log(`Loaded ${this.wallets.size} wallets from the database`);
+      console.log(`Loaded ${this.wallets.size} wallets from the database for set_id: ${setId}`);
     } catch (error) {
       console.error('Error loading wallets from database:', error);
       throw error;
@@ -146,6 +156,9 @@ export class WalletService {
       // Очищаем таблицу перед вставкой
       await client.query('DELETE FROM wallets');
       
+      // Используем 'default' как set_id, если activeWalletSetId не установлен
+      const setId = this.activeWalletSetId || 'default';
+      
       // Вставляем данные в базу данных
       for (const [indexStr, keypair] of this.wallets.entries()) {
         const index = Number(indexStr);
@@ -157,13 +170,14 @@ export class WalletService {
         else type = 'market_maker';
         
         await client.query(
-          `INSERT INTO wallets (wallet_number, public_key, private_key, wallet_type) 
-           VALUES ($1, $2, $3, $4)`,
+          `INSERT INTO wallets (wallet_number, public_key, private_key, wallet_type, set_id) 
+           VALUES ($1, $2, $3, $4, $5)`,
           [
             index,
             keypair.publicKey.toString(),
             Buffer.from(keypair.secretKey).toString('base64'),
-            type
+            type,
+            setId
           ]
         );
       }
@@ -304,8 +318,11 @@ export class WalletService {
       try {
         await client.query('BEGIN');
         
-        // Очищаем таблицу перед вставкой новых данных
-        await client.query('DELETE FROM wallets');
+        // Используем 'default' как set_id, если activeWalletSetId не установлен
+        const setId = this.activeWalletSetId || 'default';
+        
+        // Очищаем таблицу перед вставкой новых данных для текущего набора
+        await client.query('DELETE FROM wallets WHERE set_id = $1', [setId]);
         
         // Вставляем данные в базу данных
         for (const [indexStr, keypair] of this.wallets.entries()) {
@@ -318,19 +335,20 @@ export class WalletService {
           else type = 'market_maker';
           
           await client.query(
-            `INSERT INTO wallets (wallet_number, public_key, private_key, wallet_type) 
-             VALUES ($1, $2, $3, $4)`,
+            `INSERT INTO wallets (wallet_number, public_key, private_key, wallet_type, set_id) 
+             VALUES ($1, $2, $3, $4, $5)`,
             [
               index,
               keypair.publicKey.toString(),
               Buffer.from(keypair.secretKey).toString('base64'),
-              type
+              type,
+              setId
             ]
           );
         }
         
         await client.query('COMMIT');
-        console.log(`Saved ${this.wallets.size} wallets to the database`);
+        console.log(`Saved ${this.wallets.size} wallets to the database with set_id: ${setId}`);
       } catch (error) {
         await client.query('ROLLBACK');
         console.error('Error during database transaction:', error);
@@ -643,10 +661,10 @@ export class WalletService {
 
   /**
    * Gets the ID of the currently active wallet set
-   * @returns The ID of the active wallet set or null if none is selected
+   * @returns The ID of the active wallet set or 'default' if none is selected
    */
-  public getActiveWalletSetId(): string | null {
-    return this.activeWalletSetId;
+  public getActiveWalletSetId(): string {
+    return this.activeWalletSetId || 'default';
   }
 
   /**
