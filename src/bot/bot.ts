@@ -13,6 +13,8 @@ import { Keypair, LAMPORTS_PER_SOL, SendTransactionError } from '@solana/web3.js
 import { message } from 'telegraf/filters';
 import sharp from 'sharp';
 import { PublicKey } from '@solana/web3.js';
+import { DistributionStateRepository } from '../repositories/DistributionStateRepository';
+import { DatabaseService } from '../services/DatabaseService';
 
 dotenv.config();
 
@@ -30,7 +32,15 @@ let tokenHistoryService: TokenHistoryService;
 // Инициализация сервисов
 async function initializeServices() {
   walletService = await WalletService.initialize();
-  transactionService = new TransactionService(walletService);
+  
+  // Получаем экземпляр DatabaseService
+  const dbService = DatabaseService.getInstance();
+  
+  // Инициализируем репозиторий состояния распределения
+  const distributionStateRepository = new DistributionStateRepository();
+  await distributionStateRepository.initialize();
+  
+  transactionService = new TransactionService(walletService, distributionStateRepository);
   walletSetService = new WalletSetService();
   pumpFunService = new PumpFunService(walletService);
   tokenHistoryService = new TokenHistoryService();
@@ -345,9 +355,31 @@ bot.hears(WALLET_MENU_BUTTONS.DISTRIBUTE_BUNDLE, async (ctx) => {
 });
 
 bot.hears(WALLET_MENU_BUTTONS.DISTRIBUTE_MARKET, async (ctx) => {
-  console.log('Received distribute market button click');
-  
   try {
+    if (transactionService.hasUnfinishedDistribution()) {
+      const state = transactionService.getDistributionState();
+      await ctx.reply(
+        '⚠️ Обнаружено незавершенное распределение:\n\n' +
+        `📝 Остановлено на кошельке #${state!.lastProcessedWallet}\n` +
+        `💰 Осталось распределить: ${state!.remainingAmount.toFixed(4)} SOL\n\n` +
+        'Выберите действие:',
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: '▶️ Продолжить', callback_data: 'continue_distribution' },
+                { text: '🔄 Начать заново', callback_data: 'restart_distribution' },
+                { text: '❌ Отмена', callback_data: 'cancel_distribution' }
+              ]
+            ]
+          }
+        }
+      );
+      return;
+    }
+
+    console.log('Received distribute market button click');
+    
     const devWallet = walletService.getDevWallet();
     if (!devWallet) {
       throw new Error('Dev wallet not initialized');
@@ -379,8 +411,65 @@ bot.hears(WALLET_MENU_BUTTONS.DISTRIBUTE_MARKET, async (ctx) => {
     });
   } catch (error) {
     console.error('Error in distribute_market button:', error);
-    ctx.reply('❌ Error preparing market making distribution. Please try again later.');
+    ctx.reply('❌ Ошибка при подготовке распределения. Пожалуйста, попробуйте позже.');
   }
+});
+
+// Добавим обработчики для кнопок
+bot.action('continue_distribution', async (ctx) => {
+  try {
+    const state = transactionService.getDistributionState();
+    if (!state) {
+      await ctx.reply('❌ Состояние распределения не найдено');
+      return;
+    }
+
+    const message = await ctx.reply(
+      `⏳ Продолжаем распределение с кошелька #${state.lastProcessedWallet + 1}...`
+    );
+
+    const signatures = await transactionService.distributeToMarketMakers(
+      state.remainingAmount,
+      ctx.from.id.toString(), // Добавляем ID пользователя
+      false,
+      async (text) => {
+        try {
+          await ctx.telegram.editMessageText(
+            message.chat.id,
+            message.message_id,
+            undefined,
+            text
+          );
+        } catch (error) {
+          console.error('Error updating progress message:', error);
+        }
+      }
+    );
+
+    let resultMessage = '✅ Распределение успешно завершено!\n\n';
+    resultMessage += 'Транзакции:\n';
+    signatures.forEach((sig, index) => {
+      resultMessage += `${index + 1}. https://solscan.io/tx/${sig}\n`;
+    });
+
+    await ctx.reply(resultMessage);
+  } catch (error) {
+    console.error('Error continuing distribution:', error);
+    await ctx.reply(
+      '❌ Ошибка при продолжении распределения:\n' +
+      (error instanceof Error ? error.message : 'Неизвестная ошибка')
+    );
+  }
+});
+
+bot.action('restart_distribution', async (ctx) => {
+  transactionService.resetDistributionState();
+  await ctx.reply('🔄 Состояние сброшено. Используйте кнопку "Distribute Market Making" для начала нового распределения.');
+});
+
+bot.action('cancel_distribution', async (ctx) => {
+  transactionService.resetDistributionState();
+  await ctx.reply('❌ Распределение отменено');
 });
 
 bot.hears(WALLET_MENU_BUTTONS.CHECK_BALANCE, async (ctx) => {
@@ -884,9 +973,31 @@ bot.command('distribute_bundle', async (ctx) => {
 
 // Market makers distribution command
 bot.command('distribute_market', async (ctx) => {
-  console.log('Received distribute_market command from:', ctx.from?.username);
-  
   try {
+    if (transactionService.hasUnfinishedDistribution()) {
+      const state = transactionService.getDistributionState();
+      await ctx.reply(
+        '⚠️ Обнаружено незавершенное распределение:\n\n' +
+        `📝 Остановлено на кошельке #${state!.lastProcessedWallet}\n` +
+        `💰 Осталось распределить: ${state!.remainingAmount.toFixed(4)} SOL\n\n` +
+        'Выберите действие:',
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: '▶️ Продолжить', callback_data: 'continue_distribution' },
+                { text: '🔄 Начать заново', callback_data: 'restart_distribution' },
+                { text: '❌ Отмена', callback_data: 'cancel_distribution' }
+              ]
+            ]
+          }
+        }
+      );
+      return;
+    }
+
+    console.log('Received distribute_market command from:', ctx.from?.username);
+    
     const devWallet = walletService.getDevWallet();
     if (!devWallet) {
       throw new Error('Dev wallet not initialized');
@@ -912,7 +1023,7 @@ bot.command('distribute_market', async (ctx) => {
     );
   } catch (error) {
     console.error('Error in distribute_market command:', error);
-    ctx.reply('❌ Ошибка при проверке баланса. Пожалуйста, попробуйте позже.');
+    ctx.reply('❌ Ошибка при подготовке распределения. Пожалуйста, попробуйте позже.');
   }
 });
 
@@ -1573,6 +1684,7 @@ bot.on('text', async (ctx) => {
         } else if (userState.distributionType === 'marketMakers') {
           signatures = await transactionService.distributeToMarketMakers(
             amount,
+            ctx.from.id.toString(), // Добавляем ID пользователя
             userState.useLookupTable ?? false,
             progressCallback
           );

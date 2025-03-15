@@ -1,12 +1,20 @@
 import { WalletService } from './services/WalletService';
-import { TransactionService } from './services/TransactionService';
+import { TransactionService, IDistributionStateRepository, DistributionState } from './services/TransactionService';
 import { TokenCreationService } from './services/TokenCreationService';
+
+// Создаем заглушку для репозитория состояния
+class DummyDistributionStateRepository implements IDistributionStateRepository {
+    async saveState(state: DistributionState): Promise<void> {}
+    async getState(userId: string): Promise<DistributionState | null> { return null; }
+    async deleteState(userId: string): Promise<void> {}
+}
 
 async function main() {
     try {
         // Initialize services
         const walletService = await WalletService.initialize();
-        const transactionService = new TransactionService(walletService);
+        const dummyRepository = new DummyDistributionStateRepository();
+        const transactionService = new TransactionService(walletService, dummyRepository);
         const tokenCreationService = new TokenCreationService(
             walletService,
             transactionService

@@ -23,6 +23,21 @@ interface CsvWalletData {
   PRIVATE_KEY: string;
 }
 
+export interface DistributionState {
+  lastProcessedWallet: number;
+  remainingAmount: number;
+  baseAmount: number;
+  failedAttempts: number;
+  userId?: string;
+  timestamp?: number;
+}
+
+export interface IDistributionStateRepository {
+  saveState(state: DistributionState): Promise<void>;
+  getState(userId: string): Promise<DistributionState | null>;
+  deleteState(userId: string): Promise<void>;
+}
+
 export class TransactionService {
   private rpcUrls: string[];
   private currentRpcIndex: number;
@@ -32,11 +47,15 @@ export class TransactionService {
   private lookupTableService: LookupTableService;
   private bundleLUT: string | null = null;
   private marketMakingLUT: string | null = null;
+  private distributionState: DistributionState | null = null;
+  private stateRepository: IDistributionStateRepository;
   
   constructor(
-    walletService: WalletService, 
+    walletService: WalletService,
+    stateRepository: IDistributionStateRepository,
     rpcUrl: string = 'https://api.mainnet-beta.solana.com'
   ) {
+    this.stateRepository = stateRepository;
     // List of RPC endpoints to use (add your actual endpoints here)
     this.rpcUrls = [
       rpcUrl,
@@ -52,10 +71,16 @@ export class TransactionService {
   }
 
   private switchToNextRPC(): void {
+    const oldRpc = this.rpcUrls[this.currentRpcIndex];
     this.currentRpcIndex = (this.currentRpcIndex + 1) % this.rpcUrls.length;
-    console.log(`Switching to RPC endpoint: ${this.rpcUrls[this.currentRpcIndex]}`);
-    this.connection = new Connection(this.rpcUrls[this.currentRpcIndex]);
-    this.lookupTableService = new LookupTableService(this.rpcUrls[this.currentRpcIndex]);
+    const newRpc = this.rpcUrls[this.currentRpcIndex];
+    
+    console.log(`🔄 Переключение RPC:`);
+    console.log(`   ❌ Старый: ${oldRpc}`);
+    console.log(`   ✅ Новый: ${newRpc}`);
+    
+    this.connection = new Connection(newRpc);
+    this.lookupTableService = new LookupTableService(newRpc);
   }
 
   public setLookupTableAddresses(bundleLUT: string, marketMakingLUT: string) {
@@ -203,7 +228,7 @@ export class TransactionService {
                 }
                 throw error;
               }
-            }, 5, 1000);
+            }, 5);
           };
 
           batchPromises.push(sendTransaction());
@@ -214,7 +239,7 @@ export class TransactionService {
           signatures.push(...batchSignatures);
 
           if (i + BATCH_SIZE <= 23) {
-            await this.sleep(2000);
+            await this.sleep(500);
           }
         } catch (error) {
           console.error(`Error processing batch ${i}-${endIndex}:`, error);
@@ -233,37 +258,110 @@ export class TransactionService {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
+  private async sendTransaction(
+    fromWallet: Keypair,
+    toPublicKey: PublicKey,
+    amount: number
+  ): Promise<string> {
+    console.log(`🔄 Подготовка транзакции: ${amount} SOL с ${fromWallet.publicKey.toString().slice(0, 8)}... на ${toPublicKey.toString().slice(0, 8)}...`);
+    
+    const transaction = new Transaction().add(
+      SystemProgram.transfer({
+        fromPubkey: fromWallet.publicKey,
+        toPubkey: toPublicKey,
+        lamports: Math.floor(amount * LAMPORTS_PER_SOL)
+      })
+    );
+
+    const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
+    transaction.recentBlockhash = blockhash;
+    transaction.lastValidBlockHeight = lastValidBlockHeight;
+
+    const confirmOptions = {
+      skipPreflight: false,
+      commitment: 'confirmed' as const,
+      preflightCommitment: 'confirmed' as const,
+      maxRetries: 5
+    };
+
+    console.log(`📡 Отправка транзакции через RPC: ${this.rpcUrls[this.currentRpcIndex]}`);
+    
+    // Устанавливаем таймаут для транзакции
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error('Transaction timeout after 3 seconds')), 3000);
+    });
+
+    try {
+      // Используем Promise.race для ограничения времени ожидания
+      const signature = await Promise.race([
+        sendAndConfirmTransaction(
+          this.connection,
+          transaction,
+          [fromWallet],
+          confirmOptions
+        ),
+        timeoutPromise
+      ]) as string;
+      
+      console.log(`✅ Транзакция успешно отправлена: ${signature.slice(0, 12)}...`);
+      return signature;
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('timeout')) {
+        console.log(`⏱️ Превышено время ожидания (3 сек). Переключаемся на другой RPC...`);
+        this.switchToNextRPC();
+        throw error;
+      }
+      throw error;
+    }
+  }
+
   private async retryWithBackoff<T>(
     operation: () => Promise<T>,
-    maxRetries: number = 5,
-    baseDelay: number = 500
+    maxRetries: number = 5
   ): Promise<T> {
     let lastError: Error | unknown;
-    let rpcRetries = 0;
-    const maxRpcRetries = this.rpcUrls.length;
+    let attemptCount = 0;
 
     for (let i = 0; i < maxRetries; i++) {
+      attemptCount++;
+      console.log(`🔄 Попытка #${attemptCount} из ${maxRetries}...`);
+      
       try {
-        return await operation();
+        const result = await operation();
+        console.log(`✅ Операция успешно выполнена с ${attemptCount} попытки`);
+        return result;
       } catch (error: unknown) {
         lastError = error;
         if (error instanceof Error) {
-          // If we hit rate limits, try switching RPC endpoints
-          if (error.message.includes('429 Too Many Requests')) {
-            if (rpcRetries < maxRpcRetries) {
-              this.switchToNextRPC();
-              rpcRetries++;
-              continue;
-            }
+          // Логируем ошибку
+          console.error(`❌ Ошибка при выполнении операции (попытка ${attemptCount}): ${error.message}`);
+          
+          // При любой ошибке RPC или таймауте сразу переключаемся
+          if (error.message.includes('429 Too Many Requests') || 
+              error.message.includes('blockhash not found') ||
+              error.message.includes('failed to get recent blockhash') ||
+              error.message.includes('failed to send transaction') ||
+              error.message.includes('timeout')) {
+            console.log(`🔄 Переключение на следующий RPC из-за ошибки: ${error.message.slice(0, 50)}...`);
+            this.switchToNextRPC();
+            continue; // Сразу пробуем следующий RPC без задержки
           }
-          // For other errors or if we've tried all RPCs, use exponential backoff
-          const delay = baseDelay * Math.pow(2, i);
-          await this.sleep(delay);
+          
+          if (error.message.includes('insufficient funds') || 
+              error.message.includes('insufficient funds for rent')) {
+            console.error(`💰 Недостаточно средств, прекращаем попытки`);
+            throw error; // Не ретраим ошибки с балансом
+          }
+
+          // Для других ошибок делаем минимальную паузу
+          console.log(`⏱️ Пауза 100мс перед следующей попыткой...`);
+          await this.sleep(100);
           continue;
         }
         throw error;
       }
     }
+    console.error(`❌ Все ${maxRetries} попыток завершились неудачно`);
     throw lastError;
   }
 
@@ -275,7 +373,7 @@ export class TransactionService {
     progressCallback?: (text: string) => Promise<void>
   ): Promise<string[]> {
     const signatures: string[] = [];
-    const BATCH_SIZE = 3;
+    const BATCH_SIZE = 5;
 
     console.log(`Начинаем распределение для кошельков ${startIndex}-${endIndex}`);
     console.log(`Баланс кошелька #25 перед распределением: ${await this.connection.getBalance(marketMakingPayer.publicKey) / LAMPORTS_PER_SOL} SOL`);
@@ -334,7 +432,7 @@ export class TransactionService {
               if (error instanceof Error) {
                 console.error(`❌ Ошибка при отправке на кошелек #${j}:`, error.message);
                 if (error.message.includes('429 Too Many Requests')) {
-                  await this.sleep(5000);
+                  await this.sleep(1000);
                   this.switchToNextRPC();
                   throw error;
                 } else if (error.message.includes('insufficient funds')) {
@@ -346,7 +444,7 @@ export class TransactionService {
               }
               throw error;
             }
-          }, 5, 1000);
+          });
         };
 
         await this.sleep(500);
@@ -365,7 +463,7 @@ export class TransactionService {
             await progressCallback('Делаем паузу между пакетами...');
           }
           console.log(`Пауза 3 секунды перед следующим пакетом`);
-          await this.sleep(3000);
+          await this.sleep(1000);
         }
       } catch (error) {
         console.error(`❌ Ошибка при обработке пакета ${i}-${currentEndIndex}:`, error);
@@ -380,196 +478,198 @@ export class TransactionService {
 
   public async distributeToMarketMakers(
     amount: number,
+    userId: string,
     useLookupTable: boolean = false,
     progressCallback?: (text: string) => Promise<void>
   ): Promise<string[]> {
-    try {
-      const marketMakingPayer = this.walletService.getWalletByIndex(25);
-      if (!marketMakingPayer) {
-        throw new Error('Market making payer wallet (#25) not found');
-      }
+    console.log(`\n🚀 Начинаем распределение ${amount} SOL для пользователя ${userId}`);
+    
+    // Загружаем состояние для пользователя
+    await this.loadDistributionState(userId);
+    if (this.distributionState) {
+      console.log(`📋 Загружено сохраненное состояние: последний кошелек #${this.distributionState.lastProcessedWallet}, осталось ${this.distributionState.remainingAmount} SOL`);
+    } else {
+      console.log(`📋 Сохраненное состояние не найдено, начинаем с начала`);
+    }
 
-      // Проверяем баланс кошелька #25
-      const payerBalance = await this.connection.getBalance(marketMakingPayer.publicKey);
-      const totalAmount = amount * LAMPORTS_PER_SOL;
-      
-      // Учитываем комиссии за транзакции (примерно 0.000005 SOL за транзакцию)
-      const transactionFee = 5000;
-      const numberOfTransactions = 75 * 2; // Удваиваем количество транзакций (rent + distribution)
-      const totalFees = transactionFee * numberOfTransactions;
-      
-      // Получаем минимальный баланс для rent-exempt статуса
-      const rentExemptBalance = await this.connection.getMinimumBalanceForRentExemption(0);
-      const totalRentExempt = rentExemptBalance * 75; // Для всех кошельков
-      
-      console.log(`Минимальный баланс для rent-exempt: ${rentExemptBalance / LAMPORTS_PER_SOL} SOL`);
-      console.log(`Всего нужно для rent-exempt: ${totalRentExempt / LAMPORTS_PER_SOL} SOL`);
-      
-      // Проверяем, достаточно ли средств для всех транзакций с учетом rent-exempt
-      const requiredAmount = totalAmount + totalFees + totalRentExempt;
-      
-      if (payerBalance < requiredAmount) {
-        throw new Error(`Insufficient funds in wallet #25. Required: ${requiredAmount / LAMPORTS_PER_SOL} SOL (including rent-exempt and fees), Available: ${payerBalance / LAMPORTS_PER_SOL} SOL`);
-      }
+    const signatures: string[] = [];
+    const marketMakingPayer = await this.walletService.getWallet(25);
+    if (!marketMakingPayer) {
+      throw new Error('Market making payer wallet not found');
+    }
 
-      console.log(`Баланс кошелька #25: ${payerBalance / LAMPORTS_PER_SOL} SOL`);
-      console.log(`Необходимо для распределения: ${totalAmount / LAMPORTS_PER_SOL} SOL`);
-      console.log(`Комиссии за транзакции: ${totalFees / LAMPORTS_PER_SOL} SOL`);
-      console.log(`Необходимо для rent-exempt: ${totalRentExempt / LAMPORTS_PER_SOL} SOL`);
-      console.log(`Всего необходимо: ${requiredAmount / LAMPORTS_PER_SOL} SOL`);
+    console.log(`💰 Баланс кошелька #25: ${await this.connection.getBalance(marketMakingPayer.publicKey) / LAMPORTS_PER_SOL} SOL`);
 
-      // Рассчитываем базовую сумму на кошелек для распределения (без учета rent-exempt)
-      const baseAmountPerWallet = Math.floor(totalAmount / 75);
-      
-      // Рассчитываем суммы для распределения
-      let remainingAmount = totalAmount;
-      const walletAmounts: { [key: number]: number } = {};
-      const rentAmounts: { [key: number]: number } = {};
-
-      for (let i = 26; i < 100; i++) {
-        // Сумма для rent-exempt
-        rentAmounts[i] = rentExemptBalance;
-        
-        // Сумма для распределения
-        const randomizedAmount = this.getRandomizedAmount(baseAmountPerWallet);
-        walletAmounts[i] = randomizedAmount;
-        remainingAmount -= randomizedAmount;
-      }
-      
-      // Последний кошелек
-      rentAmounts[100] = rentExemptBalance;
-      walletAmounts[100] = remainingAmount;
-
-      // Функция для отправки одной транзакции
-      const sendSingleTransaction = async (
-        targetWallet: Keypair,
-        amount: number,
-        description: string
-      ): Promise<string> => {
-        const transaction = new Transaction().add(
-          SystemProgram.transfer({
-            fromPubkey: marketMakingPayer.publicKey,
-            toPubkey: targetWallet.publicKey,
-            lamports: amount
-          })
-        );
-
-        return this.retryWithBackoff(async () => {
-          try {
-            const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash();
-            transaction.recentBlockhash = blockhash;
-            transaction.lastValidBlockHeight = lastValidBlockHeight;
-
-            const confirmOptions = {
-              skipPreflight: false,
-              commitment: 'confirmed' as const,
-              preflightCommitment: 'confirmed' as const,
-              maxRetries: 5
-            };
-
-            const signature = await sendAndConfirmTransaction(
-              this.connection,
-              transaction,
-              [marketMakingPayer],
-              confirmOptions
-            );
-            console.log(`✅ ${description}: ${signature}`);
-            return signature;
-          } catch (error) {
-            if (error instanceof Error) {
-              console.error(`❌ Ошибка при ${description}:`, error.message);
-              if (error.message.includes('429 Too Many Requests')) {
-                await this.sleep(5000);
-                this.switchToNextRPC();
-                throw error;
-              }
-              throw error;
-            }
-            throw error;
-          }
-        }, 5, 1000);
+    // Если есть сохраненное состояние, используем его
+    if (this.distributionState) {
+      await progressCallback?.(`📝 Продолжаем распределение с кошелька #${this.distributionState.lastProcessedWallet}`);
+    } else {
+      // Инициализируем новое состояние
+      const baseAmount = amount / 75; // 75 кошельков (26-100)
+      this.distributionState = {
+        lastProcessedWallet: 25, // Начинаем с 26
+        remainingAmount: amount,
+        baseAmount,
+        failedAttempts: 0
       };
+      console.log(`💵 Базовая сумма на кошелек: ${baseAmount.toFixed(6)} SOL`);
+    }
 
-      // Модифицируем функцию distributeToMarketMakersBatch
-      const distributeToMarketMakersBatch = async (
-        startIndex: number,
-        endIndex: number
-      ): Promise<string[]> => {
-        const signatures: string[] = [];
-        const BATCH_SIZE = 3;
+    try {
+      // Проверяем, что состояние существует
+      if (!this.distributionState) {
+        throw new Error('Distribution state not initialized');
+      }
 
-        console.log(`\nНачинаем распределение для кошельков ${startIndex}-${endIndex}`);
-
-        for (let i = startIndex; i <= endIndex; i += BATCH_SIZE) {
-          const batchPromises = [];
-          const currentEndIndex = Math.min(i + BATCH_SIZE - 1, endIndex);
-          
-          for (let j = i; j <= currentEndIndex; j++) {
-            const targetWallet = this.walletService.getWalletByIndex(j);
-            if (!targetWallet) {
-              throw new Error(`Target wallet #${j} not found`);
-            }
-
-            // Сначала отправляем rent-exempt
-            if (progressCallback) {
-              await progressCallback(`Отправка rent-exempt ${rentAmounts[j] / LAMPORTS_PER_SOL} SOL на кошелек #${j}...`);
-            }
-            const rentSignature = await sendSingleTransaction(
-              targetWallet,
-              rentAmounts[j],
-              `Отправка rent-exempt на кошелек #${j}`
-            );
-            signatures.push(rentSignature);
-
-            await this.sleep(500);
-
-            // Затем отправляем сумму распределения
-            if (progressCallback) {
-              await progressCallback(`Отправка ${walletAmounts[j] / LAMPORTS_PER_SOL} SOL на кошелек #${j}...`);
-            }
-            const distributionSignature = await sendSingleTransaction(
-              targetWallet,
-              walletAmounts[j],
-              `Отправка распределения на кошелек #${j}`
-            );
-            signatures.push(distributionSignature);
+      // Обрабатываем кошельки пакетами для ускорения
+      const BATCH_SIZE = 5; // Обрабатываем по 5 кошельков параллельно
+      console.log(`📦 Размер пакета: ${BATCH_SIZE} кошельков`);
+      
+      for (let batchStart = this.distributionState.lastProcessedWallet + 1; batchStart <= 100; batchStart += BATCH_SIZE) {
+        const batchEnd = Math.min(batchStart + BATCH_SIZE - 1, 100);
+        console.log(`\n📦 Обработка пакета кошельков #${batchStart}-${batchEnd}`);
+        
+        // Подготавливаем массив промисов для параллельной обработки
+        const batchPromises = [];
+        const batchWallets = [];
+        
+        // Собираем информацию о кошельках для этого пакета
+        for (let i = batchStart; i <= batchEnd; i++) {
+          const targetWallet = await this.walletService.getWallet(i);
+          if (!targetWallet) {
+            console.log(`⚠️ Кошелек #${i} не найден, пропускаем`);
+            continue;
           }
-
-          if (i + BATCH_SIZE <= endIndex) {
-            if (progressCallback) {
-              await progressCallback('Делаем паузу между пакетами...');
+          
+          batchWallets.push({
+            index: i,
+            wallet: targetWallet
+          });
+        }
+        
+        console.log(`👛 Найдено ${batchWallets.length} кошельков для обработки в текущем пакете`);
+        
+        // Отображаем информацию о текущем пакете
+        const totalWallets = 75; // Всего кошельков (26-100)
+        const processedWallets = batchStart - 26; // Обработано кошельков до текущего пакета
+        const progressPercent = Math.floor((processedWallets / totalWallets) * 100);
+        
+        await progressCallback?.(`📝 Обработка пакета кошельков #${batchStart}-${batchEnd} | Прогресс: ${progressPercent}%`);
+        
+        // Создаем промисы для каждого кошелька в пакете
+        for (const { index, wallet } of batchWallets) {
+          const processWallet = async () => {
+            try {
+              // Проверяем состояние перед каждой транзакцией
+              if (!this.distributionState) {
+                throw new Error('Distribution state lost during execution');
+              }
+              
+              // Отображаем информацию о текущей транзакции
+              const amountStr = this.distributionState?.baseAmount.toFixed(4) || '0';
+              console.log(`💸 Отправка ${amountStr} SOL на кошелек #${index}...`);
+              await progressCallback?.(`📝 Отправка ${amountStr} SOL на кошелек #${index}...`);
+              
+              const signature = await this.retryWithBackoff(async () => {
+                if (!this.distributionState) {
+                  throw new Error('Distribution state lost during execution');
+                }
+                return await this.sendTransaction(
+                  marketMakingPayer,
+                  wallet.publicKey,
+                  this.distributionState.baseAmount
+                );
+              }, 3);
+              
+              console.log(`✅ Успешно отправлено ${amountStr} SOL на кошелек #${index}`);
+              return { index, signature, success: true };
+            } catch (error) {
+              console.error(`❌ Ошибка при обработке кошелька #${index}:`, error);
+              return { index, error, success: false };
             }
-            console.log(`Пауза 3 секунды перед следующим пакетом`);
-            await this.sleep(3000);
+          };
+          
+          batchPromises.push(processWallet());
+        }
+        
+        // Ожидаем завершения всех транзакций в пакете
+        console.log(`⏳ Ожидание завершения всех транзакций в пакете...`);
+        const results = await Promise.all(batchPromises);
+        
+        // Обрабатываем результаты
+        let successCount = 0;
+        let failCount = 0;
+        
+        for (const result of results) {
+          // Проверяем состояние перед обновлением
+          if (!this.distributionState) {
+            throw new Error('Distribution state lost during execution');
+          }
+          
+          if (result.success) {
+            successCount++;
+            if (result.signature) {
+              signatures.push(result.signature);
+            }
+            this.distributionState.remainingAmount -= this.distributionState.baseAmount;
+            this.distributionState.lastProcessedWallet = result.index;
+            this.distributionState.failedAttempts = 0;
+          } else if (result.error instanceof Error && result.error.message.includes('TimeoutError')) {
+            failCount++;
+            this.distributionState.failedAttempts++;
+            throw new Error(`TimeoutError at wallet #${result.index}`);
+          } else {
+            failCount++;
+            await progressCallback?.(`⚠️ Ошибка при обработке кошелька #${result.index}, пропускаем...`);
           }
         }
-
-        return signatures;
-      };
-
-      // Распределяем первую часть (26-29)
-      if (progressCallback) {
-        await progressCallback('Начинаем распределение первой части (кошельки 26-29)...');
+        
+        console.log(`📊 Результаты пакета: успешно ${successCount}, ошибок ${failCount}`);
+        
+        // Сохраняем состояние после каждого пакета
+        console.log(`💾 Сохранение состояния распределения...`);
+        await this.saveDistributionState(userId);
+        
+        // Делаем небольшую паузу между пакетами
+        console.log(`⏱️ Пауза 1 секунда перед следующим пакетом...`);
+        await this.sleep(1000);
       }
-      const firstBatchSignatures = await distributeToMarketMakersBatch(26, 29);
 
-      // Делаем длительную паузу перед второй частью
-      if (progressCallback) {
-        await progressCallback('Делаем длительную паузу перед кошельком #30...');
-      }
-      await this.sleep(15000);
+      // Успешное завершение - очищаем состояние
+      console.log(`🎉 Распределение успешно завершено! Всего отправлено ${signatures.length} транзакций`);
+      await this.clearDistributionState(userId);
+      return signatures;
 
-      // Распределяем вторую часть (30-100)
-      if (progressCallback) {
-        await progressCallback('Начинаем распределение второй части (кошельки 30-100)...');
-      }
-      const secondBatchSignatures = await distributeToMarketMakersBatch(30, 100);
-
-      return [...firstBatchSignatures, ...secondBatchSignatures];
     } catch (error) {
-      console.error('Error in distributeToMarketMakers:', error);
+      // Сохраняем состояние при ошибке
+      console.error(`❌ Ошибка при распределении:`, error);
+      await this.saveDistributionState(userId);
+      // Проверяем состояние перед отправкой сообщения об ошибке
+      if (this.distributionState && error instanceof Error && error.message.includes('TimeoutError')) {
+        const message = `⚠️ Превышено время ожидания на кошельке #${this.distributionState.lastProcessedWallet + 1}\n\n` +
+          `💰 Осталось распределить: ${this.distributionState.remainingAmount.toFixed(4)} SOL\n` +
+          `📝 Нажмите "Продолжить" для возобновления с кошелька #${this.distributionState.lastProcessedWallet + 1}`;
+        
+        console.log(message);
+        await progressCallback?.(message);
+      }
       throw error;
     }
+  }
+
+  // Метод для проверки наличия сохраненного состояния
+  hasUnfinishedDistribution(): boolean {
+    return this.distributionState !== null;
+  }
+
+  // Метод для получения информации о сохраненном состоянии
+  getDistributionState(): DistributionState | null {
+    return this.distributionState;
+  }
+
+  // Метод для сброса состояния
+  resetDistributionState(): void {
+    this.distributionState = null;
   }
 
   // Create Lookup Tables for bundle and market making wallets
@@ -668,5 +768,22 @@ export class TransactionService {
       console.error('Error getting addresses from LUT:', error);
       throw error;
     }
+  }
+
+  private async saveDistributionState(userId: string): Promise<void> {
+    if (this.distributionState) {
+      this.distributionState.userId = userId;
+      this.distributionState.timestamp = Date.now();
+      await this.stateRepository.saveState(this.distributionState);
+    }
+  }
+
+  private async loadDistributionState(userId: string): Promise<void> {
+    this.distributionState = await this.stateRepository.getState(userId);
+  }
+
+  private async clearDistributionState(userId: string): Promise<void> {
+    await this.stateRepository.deleteState(userId);
+    this.distributionState = null;
   }
 } 
