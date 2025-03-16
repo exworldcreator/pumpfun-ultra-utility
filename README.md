@@ -94,6 +94,7 @@ The bot supports Solana's Address Lookup Tables for more efficient transactions:
 - Keep your private keys secure and never share them
 - The CSV file with wallet information is deleted from the server immediately after being sent
 - Store the wallet information in a secure location
+- Private keys are stored in base58 format for better compatibility with Solana tools and wallets
 
 ## Database Structure
 
@@ -105,7 +106,7 @@ The `wallets` table stores information about all Solana wallets managed by the b
 CREATE TABLE wallets (
     wallet_number INTEGER PRIMARY KEY,    -- Номер кошелька в наборе
     public_key VARCHAR(255) NOT NULL,     -- Публичный ключ кошелька
-    private_key TEXT NOT NULL,            -- Зашифрованный приватный ключ
+    private_key TEXT NOT NULL,            -- Приватный ключ в формате base58
     wallet_type VARCHAR(50) NOT NULL,     -- Тип кошелька (dev/bundle/bundle_payer/market_maker/market_maker_payer)
     set_id VARCHAR(255) NOT NULL,         -- Идентификатор набора кошельков
     created_at TIMESTAMP WITH TIME ZONE,  -- Время создания записи
@@ -127,4 +128,4 @@ CREATE TABLE wallets (
 
 ## License
 
-MIT 
+MIT

@@ -5,6 +5,7 @@ import * as path from 'path';
 import { LookupTableService } from './LookupTableService';
 import csvParser from 'csv-parser';
 import { DatabaseService } from './DatabaseService';
+import bs58 from 'bs58';
 
 export interface WalletData {
   publicKey: string;
@@ -175,7 +176,7 @@ export class WalletService {
           [
             index,
             keypair.publicKey.toString(),
-            Buffer.from(keypair.secretKey).toString('base64'),
+            this.convertToBase58(keypair.secretKey),
             type,
             setId
           ]
@@ -195,31 +196,8 @@ export class WalletService {
 
   private loadWalletsFromFiles() {
     try {
-      // Try to load dev wallet first
-      const devWalletPath = path.join(__dirname, '../../dev-wallet.json');
-      if (fs.existsSync(devWalletPath)) {
-        try {
-          const devWalletData = JSON.parse(fs.readFileSync(devWalletPath, 'utf8'));
-          const secretKey = Buffer.from(devWalletData.privateKey, 'base64');
-          const devKeypair = Keypair.fromSecretKey(secretKey);
-          this.devWallet = devKeypair;
-          this.devWalletPublicKey = devKeypair.publicKey.toString();
-          this.wallets.set(0, devKeypair);
-          console.log('Dev wallet loaded successfully from file');
-        } catch (error) {
-          console.error('Error loading dev wallet from file, will be created later:', error);
-          // Удаляем файл с неверным форматом
-          try {
-            fs.unlinkSync(devWalletPath);
-            console.log('Removed invalid dev-wallet.json file');
-          } catch (unlinkError) {
-            console.error('Error removing invalid dev-wallet.json file:', unlinkError);
-          }
-        }
-      }
-
-      // Try to load from wallet sets
       const walletSetsPath = path.join(__dirname, '../../db/wallet-sets.json');
+      
       if (fs.existsSync(walletSetsPath)) {
         const data = fs.readFileSync(walletSetsPath, 'utf8');
         const sets = JSON.parse(data) as Record<string, WalletSetData>;
@@ -252,9 +230,17 @@ export class WalletService {
             const index = parseInt(walletData.NUMBER, 10);
             // Skip dev wallet (index 0) to preserve the original
             if (index !== 0) {
-              const secretKey = Buffer.from(walletData.PRIVATE_KEY, 'base64');
-              const keypair = Keypair.fromSecretKey(secretKey);
-              this.wallets.set(index, keypair);
+              try {
+                // Пробуем сначала декодировать как base58
+                const secretKey = bs58.decode(walletData.PRIVATE_KEY);
+                const keypair = Keypair.fromSecretKey(secretKey);
+                this.wallets.set(index, keypair);
+              } catch (e) {
+                // Если не получилось, пробуем как base64 (для обратной совместимости)
+                const secretKey = Buffer.from(walletData.PRIVATE_KEY, 'base64');
+                const keypair = Keypair.fromSecretKey(secretKey);
+                this.wallets.set(index, keypair);
+              }
             }
           });
           
@@ -278,9 +264,17 @@ export class WalletService {
         walletsData.forEach(walletData => {
           // Skip dev wallet to preserve the original
           if (walletData.index !== 0) {
-            const secretKey = Buffer.from(walletData.privateKey, 'base64');
-            const keypair = Keypair.fromSecretKey(secretKey);
-            this.wallets.set(walletData.index, keypair);
+            try {
+              // Пробуем сначала декодировать как base58
+              const secretKey = bs58.decode(walletData.privateKey);
+              const keypair = Keypair.fromSecretKey(secretKey);
+              this.wallets.set(walletData.index, keypair);
+            } catch (e) {
+              // Если не получилось, пробуем как base64 (для обратной совместимости)
+              const secretKey = Buffer.from(walletData.privateKey, 'base64');
+              const keypair = Keypair.fromSecretKey(secretKey);
+              this.wallets.set(walletData.index, keypair);
+            }
           }
         });
         
@@ -306,71 +300,47 @@ export class WalletService {
   }
 
   private async saveWalletsToDatabase() {
+    const client = await this.dbService.getClient();
     try {
-      console.log('Saving wallets to database...');
+      await client.query('BEGIN');
       
-      // Проверяем, существует ли таблица wallets
-      const tableExists = await this.dbService.query(`
-        SELECT EXISTS (
-          SELECT FROM information_schema.tables 
-          WHERE table_schema = 'public' 
-          AND table_name = 'wallets'
+      // Очищаем таблицу перед вставкой
+      await client.query('DELETE FROM wallets');
+      
+      // Используем 'default' как set_id, если activeWalletSetId не установлен
+      const setId = this.activeWalletSetId || 'default';
+      
+      // Вставляем данные в базу данных
+      for (const [indexStr, keypair] of this.wallets.entries()) {
+        const index = Number(indexStr);
+        let type: WalletData['type'];
+        if (index === 0) type = 'dev';
+        else if (index >= 1 && index <= 23) type = 'bundle';
+        else if (index === 24) type = 'bundle_payer';
+        else if (index === 25) type = 'market_maker_payer';
+        else type = 'market_maker';
+        
+        await client.query(
+          `INSERT INTO wallets (wallet_number, public_key, private_key, wallet_type, set_id) 
+           VALUES ($1, $2, $3, $4, $5)`,
+          [
+            index,
+            keypair.publicKey.toString(),
+            this.convertToBase58(keypair.secretKey),
+            type,
+            setId
+          ]
         );
-      `);
-      
-      if (!tableExists.rows[0].exists) {
-        console.log('Wallets table does not exist in the database. Creating it...');
-        const sqlFilePath = path.join(__dirname, '../db/migrations/001_create_wallets_table.sql');
-        const sqlScript = fs.readFileSync(sqlFilePath, 'utf8');
-        await this.dbService.query(sqlScript);
       }
       
-      // Используем транзакцию для атомарного обновления
-      const client = await this.dbService.getClient();
-      try {
-        await client.query('BEGIN');
-        
-        // Используем 'default' как set_id, если activeWalletSetId не установлен
-        const setId = this.activeWalletSetId || 'default';
-        
-        // Очищаем таблицу перед вставкой новых данных для текущего набора
-        await client.query('DELETE FROM wallets WHERE set_id = $1', [setId]);
-        
-        // Вставляем данные в базу данных
-        for (const [indexStr, keypair] of this.wallets.entries()) {
-          const index = Number(indexStr);
-          let type: WalletData['type'];
-          if (index === 0) type = 'dev';
-          else if (index >= 1 && index <= 23) type = 'bundle';
-          else if (index === 24) type = 'bundle_payer';
-          else if (index === 25) type = 'market_maker_payer';
-          else type = 'market_maker';
-          
-          await client.query(
-            `INSERT INTO wallets (wallet_number, public_key, private_key, wallet_type, set_id) 
-             VALUES ($1, $2, $3, $4, $5)`,
-            [
-              index,
-              keypair.publicKey.toString(),
-              Buffer.from(keypair.secretKey).toString('base64'),
-              type,
-              setId
-            ]
-          );
-        }
-        
-        await client.query('COMMIT');
-        console.log(`Saved ${this.wallets.size} wallets to the database with set_id: ${setId}`);
-      } catch (error) {
-        await client.query('ROLLBACK');
-        console.error('Error during database transaction:', error);
-        throw error;
-      } finally {
-        client.release();
-      }
+      await client.query('COMMIT');
+      console.log('Successfully saved wallets to database');
     } catch (error) {
+      await client.query('ROLLBACK');
       console.error('Error saving wallets to database:', error);
       throw error;
+    } finally {
+      client.release();
     }
   }
 
@@ -388,7 +358,7 @@ export class WalletService {
 
         walletsData.push({
           publicKey: keypair.publicKey.toString(),
-          privateKey: Buffer.from(keypair.secretKey).toString('base64'),
+          privateKey: this.convertToBase58(keypair.secretKey),
           index,
           type
         });
@@ -443,7 +413,7 @@ export class WalletService {
                WHERE wallet_number = 0 AND set_id = $3`,
               [
                 wallet.publicKey.toString(),
-                Buffer.from(wallet.secretKey).toString('base64'),
+                this.convertToBase58(wallet.secretKey),
                 this.activeWalletSetId || 'default'
               ]
             );
@@ -454,7 +424,7 @@ export class WalletService {
                VALUES (0, $1, $2, 'dev', $3)`,
               [
                 wallet.publicKey.toString(),
-                Buffer.from(wallet.secretKey).toString('base64'),
+                this.convertToBase58(wallet.secretKey),
                 this.activeWalletSetId || 'default'
               ]
             );
@@ -483,6 +453,10 @@ export class WalletService {
     return this.devWallet;
   }
 
+  private convertToBase58(secretKey: Uint8Array): string {
+    return bs58.encode(secretKey);
+  }
+
   async generateWallets(createLookupTables: boolean = false): Promise<WalletGenerationResult> {
     const wallets: WalletData[] = [];
     
@@ -496,7 +470,7 @@ export class WalletService {
       const devWalletPath = path.join(__dirname, '../../dev-wallet.json');
       const devWalletData = {
         publicKey: newDevWallet.publicKey.toString(),
-        privateKey: Buffer.from(newDevWallet.secretKey).toString('base64')
+        privateKey: this.convertToBase58(newDevWallet.secretKey)
       };
       fs.writeFileSync(devWalletPath, JSON.stringify(devWalletData, null, 2));
       console.log('Dev wallet saved to file');
@@ -511,7 +485,7 @@ export class WalletService {
     wallets.push({
       index: 0,
       publicKey: this.devWallet.publicKey.toString(),
-      privateKey: Buffer.from(this.devWallet.secretKey).toString('base64'),
+      privateKey: this.convertToBase58(this.devWallet.secretKey),
       type: 'dev'
     });
 
@@ -521,7 +495,7 @@ export class WalletService {
       wallets.push({
         index: i,
         publicKey: wallet.publicKey.toString(),
-        privateKey: Buffer.from(wallet.secretKey).toString('base64'),
+        privateKey: this.convertToBase58(wallet.secretKey),
         type: 'bundle'
       });
     }
@@ -531,7 +505,7 @@ export class WalletService {
     wallets.push({
       index: 24,
       publicKey: bundlePayerWallet.publicKey.toString(),
-      privateKey: Buffer.from(bundlePayerWallet.secretKey).toString('base64'),
+      privateKey: this.convertToBase58(bundlePayerWallet.secretKey),
       type: 'bundle_payer'
     });
 
@@ -540,7 +514,7 @@ export class WalletService {
     wallets.push({
       index: 25,
       publicKey: marketMakingPayerWallet.publicKey.toString(),
-      privateKey: Buffer.from(marketMakingPayerWallet.secretKey).toString('base64'),
+      privateKey: this.convertToBase58(marketMakingPayerWallet.secretKey),
       type: 'market_maker_payer'
     });
 
@@ -550,7 +524,7 @@ export class WalletService {
       wallets.push({
         index: i,
         publicKey: wallet.publicKey.toString(),
-        privateKey: Buffer.from(wallet.secretKey).toString('base64'),
+        privateKey: this.convertToBase58(wallet.secretKey),
         type: 'market_maker'
       });
     }
@@ -580,7 +554,7 @@ export class WalletService {
         const devWalletData = {
           index: 0,
           publicKey: this.devWallet.publicKey.toString(),
-          privateKey: Buffer.from(this.devWallet.secretKey).toString('base64'),
+          privateKey: this.convertToBase58(this.devWallet.secretKey),
           type: 'dev' as const
         };
 

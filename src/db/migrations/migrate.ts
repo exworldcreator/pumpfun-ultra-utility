@@ -2,8 +2,9 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { DatabaseService } from '../../services/DatabaseService';
 import { Keypair } from '@solana/web3.js';
-import dotenv from 'dotenv';
+import * as dotenv from 'dotenv';
 import { randomBytes } from 'crypto';
+import bs58 from 'bs58';
 
 dotenv.config();
 
@@ -32,6 +33,11 @@ function generateSetId(): string {
   // Добавляем временную метку для уникальности
   const timestamp = Date.now().toString(36);
   return `${timestamp}-${randomId}`;
+}
+
+// Вспомогательная функция для конвертации в base58
+function convertToBase58(secretKey: Uint8Array): string {
+  return bs58.encode(secretKey);
 }
 
 async function migrateWalletsToDatabase() {
@@ -65,7 +71,7 @@ async function migrateWalletsToDatabase() {
       const devWallet = Keypair.generate();
       wallets[0] = {
         publicKey: devWallet.publicKey.toString(),
-        privateKey: Buffer.from(devWallet.secretKey).toString('base64'),
+        privateKey: convertToBase58(devWallet.secretKey),
         type: 'dev'
       };
       
@@ -74,7 +80,7 @@ async function migrateWalletsToDatabase() {
         const wallet = Keypair.generate();
         wallets[i] = {
           publicKey: wallet.publicKey.toString(),
-          privateKey: Buffer.from(wallet.secretKey).toString('base64'),
+          privateKey: convertToBase58(wallet.secretKey),
           type: 'bundle'
         };
       }
@@ -83,7 +89,7 @@ async function migrateWalletsToDatabase() {
       const bundlePayerWallet = Keypair.generate();
       wallets[24] = {
         publicKey: bundlePayerWallet.publicKey.toString(),
-        privateKey: Buffer.from(bundlePayerWallet.secretKey).toString('base64'),
+        privateKey: convertToBase58(bundlePayerWallet.secretKey),
         type: 'bundle_payer'
       };
       
@@ -91,7 +97,7 @@ async function migrateWalletsToDatabase() {
       const marketMakingPayerWallet = Keypair.generate();
       wallets[25] = {
         publicKey: marketMakingPayerWallet.publicKey.toString(),
-        privateKey: Buffer.from(marketMakingPayerWallet.secretKey).toString('base64'),
+        privateKey: convertToBase58(marketMakingPayerWallet.secretKey),
         type: 'market_maker_payer'
       };
       
@@ -100,7 +106,7 @@ async function migrateWalletsToDatabase() {
         const wallet = Keypair.generate();
         wallets[i] = {
           publicKey: wallet.publicKey.toString(),
-          privateKey: Buffer.from(wallet.secretKey).toString('base64'),
+          privateKey: convertToBase58(wallet.secretKey),
           type: 'market_maker'
         };
       }
