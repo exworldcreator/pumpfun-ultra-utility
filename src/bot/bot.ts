@@ -211,26 +211,19 @@ bot.command('start', async (ctx) => {
     // Проверяем, инициализирован ли dev wallet
     let devWallet = walletService.getDevWallet();
     
-    // Если dev wallet не инициализирован, создаем все кошельки
+    // Если dev wallet не инициализирован, предлагаем создать кошельки
     if (!devWallet) {
-      console.log('Dev wallet not initialized. Generating wallets...');
+      console.log('Dev wallet not initialized. Suggesting wallet creation...');
       
-      // Генерируем все кошельки (включая dev wallet)
-      const result = await walletService.generateWallets(false);
-      console.log(`Generated ${result.wallets.length} wallets`);
-      
-      // Отправляем сообщение о создании кошельков
+      // Отправляем сообщение с предложением создать кошельки
       await ctx.reply(
-        '✅ Кошельки успешно созданы!\n\n' +
-        '📝 Кошелек #0 - dev кошелек\n' +
-        '📝 Кошельки #1-23 - bundle кошельки\n' +
-        '📝 Кошелек #24 - bundle payer кошелек\n' +
-        '📝 Кошелек #25 - market making payer кошелек\n' +
-        '📝 Кошельки #26-100 - market making кошельки'
+        '👋 Добро пожаловать в PumpFun Bot!\n\n' +
+        'Похоже, у вас еще нет кошельков. Для работы с ботом необходимо создать кошельки.\n\n' +
+        'Используйте команду /create_wallets или нажмите кнопку "Создать кошельки" в меню управления кошельками.',
+        getMainMenuKeyboard()
       );
+      return;
     }
-    
-    const balance = await transactionService.getWalletBalance(0);
     
     // Send welcome message
     const welcomeMsg = '👋 Welcome to PumpFun Bot!\n\n' +
@@ -302,12 +295,8 @@ bot.hears(WALLET_MENU_BUTTONS.CREATE_WALLETS, async (ctx) => {
   console.log('Received create wallets button click');
   
   try {
+    // Проверяем, инициализирован ли dev wallet
     const devWallet = walletService.getDevWallet();
-    if (!devWallet) {
-      throw new Error('Dev wallet not initialized');
-    }
-    
-    const balance = await transactionService.getWalletBalance(0);
     
     const keyboard = Markup.inlineKeyboard([
       [
@@ -319,13 +308,21 @@ bot.hears(WALLET_MENU_BUTTONS.CREATE_WALLETS, async (ctx) => {
     let message = 'Do you want to create Lookup Tables along with the wallets?\n\n' +
                   'Lookup Tables allow for more efficient transactions but require SOL for creation.';
     
-    if (balance < 0.03) {
-      message += '\n\n⚠️ Warning: Dev wallet has insufficient SOL for creating Lookup Tables.\n' +
-                 `Current balance: ${balance.toFixed(4)} SOL\n` +
-                 `Dev wallet address: ${devWallet.publicKey.toString()}\n` +
-                 'Please fund this wallet with at least 0.03 SOL before creating Lookup Tables.';
+    if (devWallet) {
+      // Если dev wallet уже инициализирован, проверяем баланс
+      const balance = await transactionService.getWalletBalance(0);
+      
+      if (balance < 0.03) {
+        message += '\n\n⚠️ Warning: Dev wallet has insufficient SOL for creating Lookup Tables.\n' +
+                   `Current balance: ${balance.toFixed(4)} SOL\n` +
+                   `Dev wallet address: ${devWallet.publicKey.toString()}\n` +
+                   'Please fund this wallet with at least 0.03 SOL before creating Lookup Tables.';
+      } else {
+        message += `\n\nDev wallet balance: ${balance.toFixed(4)} SOL ✅`;
+      }
     } else {
-      message += `\n\nDev wallet balance: ${balance.toFixed(4)} SOL ✅`;
+      // Если dev wallet не инициализирован, предупреждаем пользователя
+      message += '\n\n⚠️ Note: Dev wallet will be created automatically.';
     }
     
     ctx.reply(message, keyboard);
@@ -791,12 +788,8 @@ bot.command('create_wallets', async (ctx) => {
   console.log('Received create_wallets command from:', ctx.from?.username);
   
   try {
+    // Проверяем, инициализирован ли dev wallet
     const devWallet = walletService.getDevWallet();
-    if (!devWallet) {
-      throw new Error('Dev wallet not initialized');
-    }
-    
-    const balance = await transactionService.getWalletBalance(0);
     
     const keyboard = Markup.inlineKeyboard([
       [
@@ -808,13 +801,21 @@ bot.command('create_wallets', async (ctx) => {
     let message = 'Do you want to create Lookup Tables along with the wallets?\n\n' +
                   'Lookup Tables allow for more efficient transactions but require SOL for creation.';
     
-    if (balance < 0.03) {
-      message += '\n\n⚠️ Warning: Dev wallet has insufficient SOL for creating Lookup Tables.\n' +
-                 `Current balance: ${balance.toFixed(4)} SOL\n` +
-                 `Dev wallet address: ${devWallet.publicKey.toString()}\n` +
-                 'Please fund this wallet with at least 0.03 SOL before creating Lookup Tables.';
+    if (devWallet) {
+      // Если dev wallet уже инициализирован, проверяем баланс
+      const balance = await transactionService.getWalletBalance(0);
+      
+      if (balance < 0.03) {
+        message += '\n\n⚠️ Warning: Dev wallet has insufficient SOL for creating Lookup Tables.\n' +
+                   `Current balance: ${balance.toFixed(4)} SOL\n` +
+                   `Dev wallet address: ${devWallet.publicKey.toString()}\n` +
+                   'Please fund this wallet with at least 0.03 SOL before creating Lookup Tables.';
+      } else {
+        message += `\n\nDev wallet balance: ${balance.toFixed(4)} SOL ✅`;
+      }
     } else {
-      message += `\n\nDev wallet balance: ${balance.toFixed(4)} SOL ✅`;
+      // Если dev wallet не инициализирован, предупреждаем пользователя
+      message += '\n\n⚠️ Note: Dev wallet will be created automatically.';
     }
     
     ctx.reply(message, keyboard);
@@ -829,12 +830,11 @@ bot.action(/create_(with|without)_lut/, async (ctx) => {
   const createWithLUT = ctx.match[1] === 'with';
   
   try {
+    // Проверяем, инициализирован ли dev wallet
     const devWallet = walletService.getDevWallet();
-    if (!devWallet) {
-      throw new Error('Dev wallet not initialized');
-    }
     
-    if (createWithLUT) {
+    // Если dev wallet инициализирован и запрошено создание LUT, проверяем баланс
+    if (devWallet && createWithLUT) {
       const balance = await transactionService.getWalletBalance(0);
       
       if (balance < 0.03) {
