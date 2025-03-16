@@ -127,14 +127,32 @@ export class WalletService {
       // Загружаем кошельки в память
       this.wallets.clear();
       result.rows.forEach(row => {
-        const secretKey = Buffer.from(row.private_key, 'base64');
-        const keypair = Keypair.fromSecretKey(secretKey);
-        this.wallets.set(row.wallet_number, keypair);
-        
-        // Если это dev wallet (index 0), устанавливаем его
-        if (row.wallet_number === 0) {
-          this.devWallet = keypair;
-          this.devWalletPublicKey = keypair.publicKey.toString();
+        try {
+          // Пробуем сначала декодировать как base58
+          const secretKey = bs58.decode(row.private_key);
+          const keypair = Keypair.fromSecretKey(secretKey);
+          this.wallets.set(row.wallet_number, keypair);
+          
+          // Если это dev wallet (index 0), устанавливаем его
+          if (row.wallet_number === 0) {
+            this.devWallet = keypair;
+            this.devWalletPublicKey = keypair.publicKey.toString();
+          }
+        } catch (e) {
+          // Если не получилось, пробуем как base64 (для обратной совместимости)
+          try {
+            const secretKey = Buffer.from(row.private_key, 'base64');
+            const keypair = Keypair.fromSecretKey(secretKey);
+            this.wallets.set(row.wallet_number, keypair);
+            
+            // Если это dev wallet (index 0), устанавливаем его
+            if (row.wallet_number === 0) {
+              this.devWallet = keypair;
+              this.devWalletPublicKey = keypair.publicKey.toString();
+            }
+          } catch (err) {
+            console.error(`Error loading wallet #${row.wallet_number} from database:`, err);
+          }
         }
       });
       
@@ -588,9 +606,21 @@ export class WalletService {
     // Update our internal wallets map
     this.wallets.clear();
     wallets.forEach(walletData => {
-      const secretKey = Buffer.from(walletData.privateKey, 'base64');
-      const keypair = Keypair.fromSecretKey(secretKey);
-      this.wallets.set(walletData.index, keypair);
+      try {
+        // Пробуем декодировать как base58
+        const secretKey = bs58.decode(walletData.privateKey);
+        const keypair = Keypair.fromSecretKey(secretKey);
+        this.wallets.set(walletData.index, keypair);
+      } catch (e) {
+        // Если не получилось, пробуем как base64 (для обратной совместимости)
+        try {
+          const secretKey = Buffer.from(walletData.privateKey, 'base64');
+          const keypair = Keypair.fromSecretKey(secretKey);
+          this.wallets.set(walletData.index, keypair);
+        } catch (err) {
+          console.error(`Error loading wallet #${walletData.index}:`, err);
+        }
+      }
     });
 
     // Save to database if using database
@@ -625,13 +655,29 @@ export class WalletService {
         
         if (result.rows.length > 0) {
           const row = result.rows[0];
-          const secretKey = Buffer.from(row.private_key, 'base64');
-          const keypair = Keypair.fromSecretKey(secretKey);
-          
-          // Кэшируем кошелек в памяти
-          this.wallets.set(index, keypair);
-          
-          return keypair;
+          try {
+            // Пробуем сначала декодировать как base58
+            const secretKey = bs58.decode(row.private_key);
+            const keypair = Keypair.fromSecretKey(secretKey);
+            
+            // Кэшируем кошелек в памяти
+            this.wallets.set(index, keypair);
+            
+            return keypair;
+          } catch (e) {
+            // Если не получилось, пробуем как base64 (для обратной совместимости)
+            try {
+              const secretKey = Buffer.from(row.private_key, 'base64');
+              const keypair = Keypair.fromSecretKey(secretKey);
+              
+              // Кэшируем кошелек в памяти
+              this.wallets.set(index, keypair);
+              
+              return keypair;
+            } catch (err) {
+              console.error(`Error decoding private key for wallet #${index}:`, err);
+            }
+          }
         }
       } catch (error) {
         console.error(`Error loading wallet #${index} from database:`, error);
@@ -709,10 +755,22 @@ export class WalletService {
       // Load wallets from the selected set
       this.wallets.clear();
       for (const wallet of selectedSet.wallets) {
-        const keypair = Keypair.fromSecretKey(
-          Buffer.from(wallet.PRIVATE_KEY, 'base64')
-        );
-        this.wallets.set(parseInt(wallet.NUMBER), keypair);
+        try {
+          // Пробуем сначала декодировать как base58
+          const secretKey = bs58.decode(wallet.PRIVATE_KEY);
+          const keypair = Keypair.fromSecretKey(secretKey);
+          this.wallets.set(parseInt(wallet.NUMBER), keypair);
+        } catch (e) {
+          // Если не получилось, пробуем как base64 (для обратной совместимости)
+          try {
+            const keypair = Keypair.fromSecretKey(
+              Buffer.from(wallet.PRIVATE_KEY, 'base64')
+            );
+            this.wallets.set(parseInt(wallet.NUMBER), keypair);
+          } catch (err) {
+            console.error(`Error loading wallet #${wallet.NUMBER} from set ${setName}:`, err);
+          }
+        }
       }
 
       console.log(`Successfully loaded wallet set ${setName}`);
