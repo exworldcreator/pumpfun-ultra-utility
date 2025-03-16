@@ -95,6 +95,36 @@ The bot supports Solana's Address Lookup Tables for more efficient transactions:
 - The CSV file with wallet information is deleted from the server immediately after being sent
 - Store the wallet information in a secure location
 
+## Database Structure
+
+### Wallets Table
+
+The `wallets` table stores information about all Solana wallets managed by the bot:
+
+```sql
+CREATE TABLE wallets (
+    wallet_number INTEGER PRIMARY KEY,    -- Номер кошелька в наборе
+    public_key VARCHAR(255) NOT NULL,     -- Публичный ключ кошелька
+    private_key TEXT NOT NULL,            -- Зашифрованный приватный ключ
+    wallet_type VARCHAR(50) NOT NULL,     -- Тип кошелька (dev/bundle/bundle_payer/market_maker/market_maker_payer)
+    set_id VARCHAR(255) NOT NULL,         -- Идентификатор набора кошельков
+    created_at TIMESTAMP WITH TIME ZONE,  -- Время создания записи
+    updated_at TIMESTAMP WITH TIME ZONE   -- Время последнего обновления
+);
+```
+
+#### Indexes
+- `idx_wallets_public_key` - для быстрого поиска по публичному ключу
+- `idx_wallets_set_id` - для быстрого поиска по идентификатору набора
+- `idx_wallets_public_key_set_id` - уникальный индекс для комбинации публичного ключа и идентификатора набора
+
+#### Wallet Types
+- `dev` (0) - Кошелек разработчика, используется для создания LUT
+- `bundle` (1-23) - Кошельки для пакетных операций
+- `bundle_payer` (24) - Кошелек для оплаты пакетных операций
+- `market_maker_payer` (25) - Кошелек для оплаты операций маркет-мейкинга
+- `market_maker` (26-100) - Кошельки для маркет-мейкинга
+
 ## License
 
 MIT 
